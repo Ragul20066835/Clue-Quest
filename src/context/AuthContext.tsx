@@ -5,16 +5,25 @@ import { request, setStoredToken, getStoredToken } from '../utils/api.js';
 interface AuthContextType {
   user: User | null;
   loading: boolean;
-  login: (playerCode: string, password: string) => Promise<{ success: boolean; user?: User; error?: string }>;
+  login: (
+    playerCode: string,
+    password: string
+  ) => Promise<{ success: boolean; user?: User; error?: string }>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
-  registerTeam: (teamName: string) => Promise<{ success: boolean; user?: User; error?: string }>;
-  updateTeam: (teamName: string) => Promise<{ success: boolean; user?: User; error?: string }>;
+  registerTeam: (
+    teamName: string
+  ) => Promise<{ success: boolean; user?: User; error?: string }>;
+  updateTeam: (
+    teamName: string
+  ) => Promise<{ success: boolean; user?: User; error?: string }>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
+  children,
+}) => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
@@ -36,59 +45,120 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const login = async (playerCode: string, password: string) => {
     try {
-      const res = await request<{ success: boolean; token: string; user: User }>('/auth/login', {
+      const res = await request<{
+        success: boolean;
+        token: string;
+        user: User;
+      }>('/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ player_code: playerCode, password }),
+        body: JSON.stringify({
+          player_code: playerCode,
+          password,
+        }),
       });
 
       if (res.success && res.user) {
         setStoredToken(res.token);
         setUser(res.user);
-        return { success: true, user: res.user };
+
+        return {
+          success: true,
+          user: res.user,
+        };
       }
-      return { success: false, error: 'Login failed' };
+
+      return {
+        success: false,
+        error: 'Login failed',
+      };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Authentication error' };
+      return {
+        success: false,
+        error: err.message || 'Authentication error',
+      };
     }
   };
 
   const registerTeam = async (teamName: string) => {
     try {
-      const res = await request<{ success: boolean; user: User; message?: string }>('/auth/team', {
+      const res = await request<{
+        success: boolean;
+        token: string;
+        user: User;
+        message?: string;
+      }>('/auth/team', {
         method: 'POST',
-        body: JSON.stringify({ teamName }),
+        body: JSON.stringify({
+          teamName,
+        }),
       });
+
       if (res.success && res.user) {
+        // IMPORTANT:
+        // Save the JWT returned during team registration.
+        // This allows /auth/me and /game/state to authenticate.
+        setStoredToken(res.token);
         setUser(res.user);
-        return { success: true, user: res.user };
+
+        return {
+          success: true,
+          user: res.user,
+        };
       }
-      return { success: false, error: 'Failed to register team name.' };
+
+      return {
+        success: false,
+        error: 'Failed to register team name.',
+      };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Failed to register team name.' };
+      return {
+        success: false,
+        error: err.message || 'Failed to register team name.',
+      };
     }
   };
 
   const updateTeam = async (teamName: string) => {
     try {
-      const res = await request<{ success: boolean; user: User; message?: string }>('/auth/team', {
+      const res = await request<{
+        success: boolean;
+        user: User;
+        message?: string;
+      }>('/auth/team', {
         method: 'PATCH',
-        body: JSON.stringify({ teamName }),
+        body: JSON.stringify({
+          teamName,
+        }),
       });
+
       if (res.success && res.user) {
         setUser(res.user);
-        return { success: true, user: res.user };
+
+        return {
+          success: true,
+          user: res.user,
+        };
       }
-      return { success: false, error: 'Failed to update team name.' };
+
+      return {
+        success: false,
+        error: 'Failed to update team name.',
+      };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Failed to update team name.' };
+      return {
+        success: false,
+        error: err.message || 'Failed to update team name.',
+      };
     }
   };
 
   const logout = async () => {
     try {
-      await request('/auth/logout', { method: 'POST' });
+      await request('/auth/logout', {
+        method: 'POST',
+      });
     } catch {
-      // ignore
+      // Ignore logout request errors
     } finally {
       setUser(null);
       setStoredToken(null);
@@ -96,7 +166,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser, registerTeam, updateTeam }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        login,
+        logout,
+        refreshUser,
+        registerTeam,
+        updateTeam,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
@@ -104,8 +184,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
+
   if (!context) {
     throw new Error('useAuth must be used within an AuthProvider');
   }
+
   return context;
 };
