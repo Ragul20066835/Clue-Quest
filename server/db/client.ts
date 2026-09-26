@@ -76,6 +76,53 @@ export const db = {
     return executeMemoryQuery<T>(sql, params);
   },
 
+  async transaction<T>(callback: (client: { query: <R = any>(sql: string, params?: any[]) => Promise<{ rows: R[]; rowCount: number }> }) => Promise<T>): Promise<T> {
+    if (isNeon && pgPool) {
+      const client = await pgPool.connect();
+      try {
+        await client.query('BEGIN');
+        const queryWrapper = async <R = any>(sql: string, params: any[] = []): Promise<{ rows: R[]; rowCount: number }> => {
+          const res = await client.query(sql, params);
+          return { rows: res.rows, rowCount: res.rowCount || 0 };
+        };
+        const result = await callback({ query: queryWrapper });
+        await client.query('COMMIT');
+        return result;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    } else {
+      // Create deep snapshot of memoryStore for high-fidelity transaction rollback support
+      const snapshot = {
+        users: new Map(Array.from(memoryStore.users.entries()).map(([k, v]) => [k, { ...v }])),
+        events: new Map(Array.from(memoryStore.events.entries()).map(([k, v]) => [k, { ...v }])),
+        questions: new Map(Array.from(memoryStore.questions.entries()).map(([k, v]) => [k, { ...v }])),
+        clues: new Map(Array.from(memoryStore.clues.entries()).map(([k, v]) => [k, { ...v }])),
+        game_sessions: new Map(Array.from(memoryStore.game_sessions.entries()).map(([k, v]) => [k, { ...v }])),
+        question_attempts: new Map(Array.from(memoryStore.question_attempts.entries()).map(([k, v]) => [k, { ...v }])),
+        event_logs: memoryStore.event_logs.map(log => ({ ...log })),
+      };
+      try {
+        const result = await callback({
+          query: async <R = any>(sql: string, params: any[] = []) => executeMemoryQuery<R>(sql, params),
+        });
+        return result;
+      } catch (err) {
+        memoryStore.users = snapshot.users;
+        memoryStore.events = snapshot.events;
+        memoryStore.questions = snapshot.questions;
+        memoryStore.clues = snapshot.clues;
+        memoryStore.game_sessions = snapshot.game_sessions;
+        memoryStore.question_attempts = snapshot.question_attempts;
+        memoryStore.event_logs = snapshot.event_logs;
+        throw err;
+      }
+    }
+  },
+
   getMemoryStore: () => memoryStore,
 };
 
@@ -152,6 +199,28 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
     }
     if (lower.includes('count(*)')) {
       return { rows: [{ count: String(rows.length) }] as any, rowCount: 1 };
+    }
+    if (lower.includes('unlocked_clues')) {
+      const clueLevel = Number(params[1] || 1);
+      const sessionId = params[2];
+      const enriched = rows.map(q => {
+        const unlockedClues = Array.from(memoryStore.clues.values())
+          .filter(c => c.question_id === q.id && c.level <= clueLevel)
+          .sort((a, b) => a.level - b.level);
+        const attempt = sessionId
+          ? Array.from(memoryStore.question_attempts.values()).find(qa => qa.session_id === sessionId && qa.question_id === q.id) || null
+          : null;
+        return {
+          id: q.id,
+          question_number: q.question_number,
+          question_text: q.question_text,
+          category: q.category,
+          is_active: q.is_active,
+          unlocked_clues: unlockedClues,
+          attempt: attempt,
+        };
+      });
+      return { rows: enriched as any, rowCount: enriched.length };
     }
     rows.sort((a, b) => a.question_number - b.question_number);
     return { rows: rows as any, rowCount: rows.length };
@@ -288,7 +357,7 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
       countdown_started_at: null,
       started_at: params[4] || null,
       completed_at: params[5] || null,
-      created_at: new Date().toISOString(),
+      created_at: (params.length >= 8 && params[7] ? params[7] : new Date().toISOString()),
     };
     memoryStore.events.set(evt.id, evt);
     return { rows: [evt as any], rowCount: 1 };
@@ -395,7 +464,8 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
         if (user.role === 'PLAYER') {
           if (lower.includes('team_name = null') || lower.includes('team_name=null')) {
             user.team_name = null;
-            user.display_name = `Participant ${user.player_code.replace('CQ', '')} (ECE)`;
+            const num = parseInt(user.player_code.replace('CQ', ''), 10);
+            user.display_name = `Participant ${String(num).padStart(2, '0')} (ECE)`;
             user.updated_at = new Date().toISOString();
             count++;
           }

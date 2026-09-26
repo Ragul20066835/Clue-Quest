@@ -1,16 +1,24 @@
 import React, { useState } from 'react';
-import { Play, Pause, Square, RotateCcw, AlertCircle, CheckCircle2, ShieldAlert, Sparkles, Radio } from 'lucide-react';
+import { Play, Pause, Square, RotateCcw, AlertCircle, CheckCircle2, ShieldAlert, Sparkles, Radio, Layers } from 'lucide-react';
 import { EventInfo } from '../../types/index.js';
 
 interface EventControllerProps {
   event: EventInfo;
   onAction: (action: 'START' | 'START_NOW' | 'PAUSE' | 'RESUME' | 'END' | 'RESET') => Promise<void>;
+  onPrepareNextEvent?: (customName?: string) => Promise<void>;
   isLoading: boolean;
 }
 
-export const EventController: React.FC<EventControllerProps> = ({ event, onAction, isLoading }) => {
+export const EventController: React.FC<EventControllerProps> = ({
+  event,
+  onAction,
+  onPrepareNextEvent,
+  isLoading,
+}) => {
   const [showStartConfirm, setShowStartConfirm] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [showPrepareNextModal, setShowPrepareNextModal] = useState(false);
+  const [customEventName, setCustomEventName] = useState('');
 
   const getStatusBadge = () => {
     switch (event.status) {
@@ -57,6 +65,14 @@ export const EventController: React.FC<EventControllerProps> = ({ event, onActio
     await onAction('START_NOW');
   };
 
+  const handlePrepareNextConfirm = async () => {
+    if (onPrepareNextEvent) {
+      await onPrepareNextEvent(customEventName.trim() || undefined);
+      setShowPrepareNextModal(false);
+      setCustomEventName('');
+    }
+  };
+
   return (
     <>
       {/* START CONFIRMATION MODAL */}
@@ -101,6 +117,85 @@ export const EventController: React.FC<EventControllerProps> = ({ event, onActio
               >
                 <Play className="w-4 h-4 fill-current" />
                 {isLoading ? 'STARTING...' : 'START NOW'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PREPARE NEXT EVENT CONFIRMATION MODAL */}
+      {showPrepareNextModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-navy-950/85 backdrop-blur-md">
+          <div className="w-full max-w-lg bg-navy-900 border border-indigo-500/50 rounded-xl p-6 shadow-2xl text-center">
+            <div className="p-3.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 w-fit mx-auto mb-4">
+              <Layers className="w-8 h-8 text-indigo-400" />
+            </div>
+
+            <h3 className="text-xl font-display font-extrabold text-white mb-2 tracking-wide">
+              PREPARE NEXT EVENT?
+            </h3>
+
+            <p className="text-xs text-slate-300 font-sans mb-4">
+              This creates a completely new tournament event cycle while keeping all historical data safe.
+            </p>
+
+            <div className="bg-navy-950/90 rounded-lg p-4 border border-slate-800 text-xs font-mono text-slate-300 space-y-2 mb-5 text-left">
+              <p className="flex items-center gap-2 text-indigo-300 font-bold">
+                ✓ A new event will be created in WAITING status.
+              </p>
+              <p className="flex items-center gap-2 text-emerald-400 font-bold">
+                ✓ All 40 participant slots will be cleared for fresh registration.
+              </p>
+              <p className="flex items-center gap-2 text-cyan-300">
+                ✓ Previous event game sessions and answer history will NOT be deleted.
+              </p>
+              <p className="flex items-center gap-2 text-slate-300">
+                ✓ Questions and clues will NOT be deleted.
+              </p>
+              <p className="flex items-center gap-2 text-slate-300">
+                ✓ Admin accounts will NOT be affected.
+              </p>
+              <p className="flex items-center gap-2 text-slate-400">
+                ✓ Existing participant accounts/slots remain available for reuse.
+              </p>
+            </div>
+
+            <div className="text-left mb-6">
+              <label className="block text-[11px] font-mono text-slate-400 uppercase tracking-wider mb-1.5 font-semibold">
+                EVENT NAME (OPTIONAL)
+              </label>
+              <input
+                type="text"
+                value={customEventName}
+                onChange={(e) => setCustomEventName(e.target.value)}
+                placeholder={`e.g. ${event.name} - Round 2`}
+                className="w-full bg-navy-950 border border-slate-700 focus:border-indigo-400 rounded px-3 py-2 text-xs font-mono text-white placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+              />
+              <p className="text-[10px] text-slate-500 font-sans mt-1">
+                Leave blank to auto-generate sequential event title.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPrepareNextModal(false);
+                  setCustomEventName('');
+                }}
+                disabled={isLoading}
+                className="px-5 py-2.5 rounded text-xs font-mono text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 transition"
+              >
+                CANCEL
+              </button>
+              <button
+                type="button"
+                onClick={handlePrepareNextConfirm}
+                disabled={isLoading}
+                className="px-6 py-2.5 rounded font-mono font-extrabold text-xs uppercase tracking-wider bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/30 flex items-center gap-2 transition"
+              >
+                <Layers className="w-4 h-4" />
+                {isLoading ? 'PREPARING NEXT EVENT...' : 'CONFIRM & PREPARE NEXT EVENT'}
               </button>
             </div>
           </div>
@@ -184,6 +279,17 @@ export const EventController: React.FC<EventControllerProps> = ({ event, onActio
               </>
             )}
 
+            {/* PREPARE NEXT EVENT BUTTON (Distinct styling & safe new event cycle) */}
+            <button
+              onClick={() => setShowPrepareNextModal(true)}
+              disabled={isLoading}
+              className="px-4 py-2.5 rounded font-mono font-bold text-xs uppercase tracking-wider bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 hover:border-indigo-400 transition flex items-center gap-2 shadow-sm"
+              title="Prepare a brand new event round while preserving all past event history"
+            >
+              <Layers className="w-3.5 h-3.5 text-indigo-400" />
+              PREPARE NEXT EVENT
+            </button>
+
             {(event.status === 'ENDED' || event.status === 'LIVE' || event.status === 'PAUSED') && (
               confirmReset ? (
                 <div className="flex items-center gap-1.5 bg-rose-950/80 border border-rose-500/50 p-1 rounded">
@@ -222,3 +328,4 @@ export const EventController: React.FC<EventControllerProps> = ({ event, onActio
     </>
   );
 };
+

@@ -1,4 +1,48 @@
+import express from 'express';
+import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import { initDb, db } from './db/client.js';
+import { seedDatabase } from './db/seed.js';
+import { authRouter } from './routes/authRoutes.js';
+import { gameRouter } from './routes/gameRoutes.js';
+import { eventRouter } from './routes/eventRoutes.js';
+import { adminRouter } from './routes/adminRoutes.js';
+
 const BASE_URL = 'http://127.0.0.1:3001/api';
+let serverInstance: any = null;
+
+async function ensureServerRunning() {
+  try {
+    const res = await fetch(`${BASE_URL}/health`);
+    if (res.ok) return;
+  } catch {
+    // Server not running, launch in-process test server
+  }
+
+  const app = express();
+  app.use(cors({ origin: true, credentials: true }));
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true }));
+  app.use(cookieParser());
+
+  await initDb();
+  await seedDatabase();
+
+  app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', service: 'CLUE QUEST Test Server' });
+  });
+
+  app.use('/api/auth', authRouter);
+  app.use('/api/game', gameRouter);
+  app.use('/api/event', eventRouter);
+  app.use('/api/admin', adminRouter);
+
+  await new Promise<void>((resolve) => {
+    serverInstance = app.listen(3001, '127.0.0.1', () => {
+      resolve();
+    });
+  });
+}
 
 async function api(path: string, options: { method?: string; body?: any; token?: string; cookie?: string } = {}) {
   const url = `${BASE_URL}${path}`;
@@ -24,6 +68,8 @@ async function api(path: string, options: { method?: string; body?: any; token?:
 }
 
 async function runTests() {
+  await ensureServerRunning();
+
   console.log('🧪 ========================================================');
   console.log('⚡ CLUE QUEST PRODUCTION UPDATE TEST SUITE');
   console.log('🏫 VSB Engineering College - Department of ECE');
@@ -424,14 +470,209 @@ async function runTests() {
   const refreshedState = await api('/game/state', { token: player1Token });
   assert(refreshedState.data.deadline_at === liveTimerState.data.deadline_at, 'Timer survives refresh without resetting deadline');
 
+  // ========================================================
+  // 12. COMPREHENSIVE "PREPARE NEXT EVENT" SAFETY & VERIFICATION SUITE
+  // ========================================================
+  console.log('\n--- 12. Comprehensive Prepare Next Event Verification Suite ---');
+
+  // Case 1: Authorization Checks
+  console.log('\n[Case 1: Authorization Checks]');
+  const unauthRes = await api('/admin/events/prepare-next', { method: 'POST', body: {} });
+  assert(unauthRes.status === 401, 'Unauthenticated request to /admin/events/prepare-next rejected with 401 Unauthorized');
+
+  const playerAuthRes = await api('/admin/events/prepare-next', { method: 'POST', token: player1Token, body: {} });
+  assert(playerAuthRes.status === 403, 'PLAYER role request to /admin/events/prepare-next rejected with 403 Forbidden');
+
+  // Capture/Ensure Representative Historical Data from Event 1
+  console.log('\n[Case 4 (Setup): Verify Representative Historical Data in Event 1]');
+  const preStatus = await api('/event/status');
+  const event1Id = preStatus.data.event.id;
+  const event1Name = preStatus.data.event.name;
+  assert(Boolean(event1Id), `Event 1 ID identified as "${event1Id}"`);
+
+  const memStore = db.getMemoryStore();
+  const player1UserPre = Array.from(memStore.users.values()).find(u => u.player_code === 'CQ001')!;
+  const initialPasswordHash = player1UserPre.password_hash;
+  const initialPlayerId = player1UserPre.id;
+
+  // Ensure an active game_session and question_attempt exist for Event 1
+  let e1Session = Array.from(memStore.game_sessions.values()).find(s => s.event_id === event1Id && s.user_id === initialPlayerId);
+  if (!e1Session) {
+    e1Session = {
+      id: `sess_e1_${Date.now()}`,
+      event_id: event1Id,
+      user_id: initialPlayerId,
+      status: 'COMPLETED',
+      current_question: 1,
+      current_clue_level: 2,
+      current_question_value: 75,
+      total_score: 75,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    memStore.game_sessions.set(e1Session.id, e1Session);
+  }
+
+  const q1Id = Array.from(memStore.questions.values())[0]?.id || 'q1';
+  const representativeAttemptId = `att_e1_${Date.now()}`;
+  memStore.question_attempts.set(representativeAttemptId, {
+    id: representativeAttemptId,
+    session_id: e1Session.id,
+    question_id: q1Id,
+    highest_clue_level: 2,
+    final_question_value: 75,
+    user_answer: 'RESISTOR',
+    correct_answer: 'RESISTOR',
+    is_correct: true,
+    earned_points: 75,
+    submitted_at: new Date().toISOString(),
+  });
+
+  const initialAttemptsCount = memStore.question_attempts.size;
+  const initialSessionsCount = memStore.game_sessions.size;
+  assert(initialAttemptsCount >= 1, `Verified historical question_attempts exist (${initialAttemptsCount} found)`);
+  assert(initialSessionsCount >= 1, `Verified historical game_sessions exist (${initialSessionsCount} found)`);
+
+  // Case 2 & 3: Prepare Next Event - Creation & Participant Slot Clearing
+  console.log('\n[Case 2 & 3: New Event Creation & Participant Slot Clearing]');
+  const prepareNextRes = await api('/admin/events/prepare-next', {
+    method: 'POST',
+    token: adminToken,
+    body: { name: 'CLUE QUEST 2026 - Championship Round 2' },
+  });
+
+  assert(prepareNextRes.ok && prepareNextRes.data.success === true, 'ADMIN role request to /admin/events/prepare-next succeeds (200 OK)');
+  assert(prepareNextRes.data.previous_event_id === event1Id, `previous_event_id matches original event ID ("${event1Id}")`);
+  assert(prepareNextRes.data.new_event_id && prepareNextRes.data.new_event_id !== event1Id, 'new_event_id is unique and distinct from previous_event_id');
+  assert(prepareNextRes.data.event.status === 'WAITING', 'New event status is WAITING');
+  assert(prepareNextRes.data.event.max_players === 40, 'max_players correctly inherited as 40');
+  assert(prepareNextRes.data.cleared_participant_slots === 40, 'cleared_participant_slots is exactly 40');
+
+  // Verify new event is active under ORDER BY created_at DESC
+  const newOverview = await api('/admin/overview', { token: adminToken });
+  assert(newOverview.data.event.id === prepareNextRes.data.new_event_id, 'New event is now the active event under ORDER BY created_at DESC');
+  assert(newOverview.data.event.name === 'CLUE QUEST 2026 - Championship Round 2', 'New event name matches requested title');
+
+  // Case 7: Duplicate / Rapid Double-Click Protection
+  console.log('\n[Case 7: Duplicate / Rapid Double-Click Protection]');
+  const duplicateAttempt = await api('/admin/events/prepare-next', {
+    method: 'POST',
+    token: adminToken,
+    body: { name: 'Duplicate Event' },
+  });
+  assert(duplicateAttempt.status === 400 || duplicateAttempt.status === 409, 'Rapid duplicate prepare-next request blocked with error (400/409)');
+
+  // Verify all 40 slots have team_name = NULL and display_name reset, while user records remain intact
+  let allSlotsCleared = true;
+  let allSlotNamesDefault = true;
+  let allSlotsPreserved = true;
+
+  for (let i = 1; i <= 40; i++) {
+    const code = `CQ${String(i).padStart(3, '0')}`;
+    const userInDb = Array.from(memStore.users.values()).find(u => u.player_code === code);
+    if (!userInDb || userInDb.team_name !== null) allSlotsCleared = false;
+    if (userInDb && userInDb.display_name !== `Participant ${String(i).padStart(2, '0')} (ECE)`) allSlotNamesDefault = false;
+    if (!userInDb || userInDb.role !== 'PLAYER') allSlotsPreserved = false;
+  }
+  assert(allSlotsCleared, 'All 40 participant slots have team_name = NULL (ready for new registrations)');
+  assert(allSlotNamesDefault, 'All 40 participant display_names reset to default "Participant XX (ECE)"');
+  assert(allSlotsPreserved, 'All 40 participant user records & roles remain in database');
+
+  const p1After = Array.from(memStore.users.values()).find(u => u.player_code === 'CQ001');
+  assert(p1After.id === initialPlayerId, 'PLAYER user ID (usr_player_001) unchanged');
+  assert(p1After.player_code === 'CQ001', 'player_code (CQ001) unchanged');
+  assert(p1After.password_hash === initialPasswordHash, 'password_hash unchanged');
+
+  // Verify Admin account untouched
+  const adminUser = Array.from(memStore.users.values()).find(u => u.role === 'ADMIN');
+  assert(adminUser && adminUser.player_code === 'admin' && adminUser.display_name === 'ECE Department Admin', 'Admin user account is completely unaffected');
+
+  // Case 4: Historical Data Preservation Verification
+  console.log('\n[Case 4: Historical Data Preservation Verification]');
+  const prevEventInDb = memStore.events.get(event1Id);
+  assert(Boolean(prevEventInDb), 'Previous event record still exists in database');
+  assert(prevEventInDb.id === event1Id, 'Previous event ID preserved');
+
+  const prevSessionsAfter = Array.from(memStore.game_sessions.values()).filter(s => s.event_id === event1Id);
+  assert(prevSessionsAfter.length === initialSessionsCount, `Previous event game_sessions preserved (${prevSessionsAfter.length} session(s) found)`);
+
+  const prevAttemptsAfter = Array.from(memStore.question_attempts.values());
+  assert(prevAttemptsAfter.length === initialAttemptsCount, `Previous event question_attempts preserved (${prevAttemptsAfter.length} attempt(s) found)`);
+
+  const prevLogs = memStore.event_logs.filter(l => l.action === 'PREPARE_NEXT_EVENT');
+  assert(prevLogs.length >= 1, 'Audit log PREPARE_NEXT_EVENT recorded in database');
+  const prepareLog = prevLogs[prevLogs.length - 1];
+  assert(prepareLog.metadata?.previous_event_id === event1Id, 'Audit log records previous_event_id');
+  assert(prepareLog.metadata?.new_event_id === prepareNextRes.data.new_event_id, 'Audit log records new_event_id');
+
+  // Case 5: New Event Registration & Isolated Gameplay
+  console.log('\n[Case 5: New Event Registration & Isolated Gameplay]');
+  const newTeamReg = await api('/auth/team', {
+    method: 'POST',
+    body: { teamName: 'QUANTUM LOGIC' },
+  });
+  assert(newTeamReg.ok && newTeamReg.data.user.player_code === 'CQ001', 'New team "QUANTUM LOGIC" receives available slot CQ001');
+  assert(newTeamReg.data.user.team_name === 'QUANTUM LOGIC', 'Slot CQ001 assigned team name "QUANTUM LOGIC"');
+  const newTeamToken = newTeamReg.data.token;
+
+  // Start the new event
+  await api('/admin/event/control', {
+    method: 'POST',
+    token: adminToken,
+    body: { action: 'START_NOW' },
+  });
+  await new Promise(r => setTimeout(r, 5500)); // wait for countdown
+
+  const newEventGameState = await api('/game/state', { token: newTeamToken });
+  assert(newEventGameState.ok && newEventGameState.data.event.id === prepareNextRes.data.new_event_id, 'Gameplay session belongs to the NEW event');
+  assert(newEventGameState.data.session.event_id === prepareNextRes.data.new_event_id, 'game_sessions record references new_event_id');
+  assert(newEventGameState.data.session.current_question === 1, 'New session starts cleanly at Question 1');
+  assert(newEventGameState.data.session.total_score === 0, 'New session starts cleanly with Total Score 0');
+
+  // Case 6: Existing RESET Behavior Verification
+  console.log('\n[Case 6: Existing RESET Behavior Unchanged]');
+  const resetOldWay = await api('/admin/event/control', {
+    method: 'POST',
+    token: adminToken,
+    body: { action: 'RESET' },
+  });
+  assert(resetOldWay.ok && resetOldWay.data.status === 'WAITING', 'Existing RESET endpoint still sets status to WAITING');
+  const overviewAfterReset = await api('/admin/overview', { token: adminToken });
+  assert(overviewAfterReset.data.event.id === prepareNextRes.data.new_event_id, 'RESET reuses the same event ID without creating a new event');
+
+  // Case 8: Transaction Rollback Simulation
+  console.log('\n[Case 8: Transaction Rollback Verification]');
+  let rollbackSucceeded = false;
+  try {
+    await db.transaction(async (tx) => {
+      await tx.query(`INSERT INTO events (id, name, status, max_players, countdown_started_at, started_at, completed_at, created_at)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                      ['evt_rollback_test', 'Rollback Test Event', 'WAITING', 40, null, null, null, new Date().toISOString()]);
+      throw new Error('SIMULATED_TRANSACTION_FAILURE');
+    });
+  } catch (err: any) {
+    if (err.message === 'SIMULATED_TRANSACTION_FAILURE') {
+      rollbackSucceeded = true;
+    }
+  }
+  assert(rollbackSucceeded, 'Transaction threw and caught simulated failure');
+  const rolledBackEvent = memStore.events.get('evt_rollback_test');
+  assert(rolledBackEvent === undefined, 'Rolled back event was NOT committed to the database');
+
   console.log('\n========================================================');
   console.log(`🏁 TEST RESULTS: ${passed} PASSED | ${failed} FAILED`);
   console.log('========================================================\n');
+
+  if (serverInstance) {
+    serverInstance.close();
+  }
 
   if (failed > 0) process.exit(1);
 }
 
 runTests().catch(err => {
   console.error('Test runner fatal error:', err);
+  if (serverInstance) serverInstance.close();
   process.exit(1);
 });

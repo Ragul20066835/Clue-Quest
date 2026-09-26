@@ -375,6 +375,127 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
   }
 });
 
+// Mutex lock for concurrent double-click / rapid request prevention
+let isPreparingNextEvent = false;
+
+// Helper to calculate the next sequential event title
+function generateNextEventName(currentName: string, customName?: string): string {
+  if (customName && typeof customName === 'string' && customName.trim().length >= 2) {
+    return customName.trim();
+  }
+  const cleanName = currentName || 'CLUE QUEST 2026 - ECE Championship';
+  const roundMatch = cleanName.match(/(?:Round|Event|\bPart)\s*(\d+)/i);
+  if (roundMatch) {
+    const nextNum = parseInt(roundMatch[1], 10) + 1;
+    return cleanName.replace(/(?:Round|Event|\bPart)\s*\d+/i, `Round ${nextNum}`);
+  }
+  return `${cleanName} - Round 2`;
+}
+
+// 2b. Prepare Next Event Handler (Safe Participant Clear + New Event Creation)
+async function handlePrepareNextEvent(req: AuthenticatedRequest, res: Response): Promise<void> {
+  if (isPreparingNextEvent) {
+    res.status(409).json({ error: 'A prepare next event operation is already in progress. Please wait.' });
+    return;
+  }
+
+  isPreparingNextEvent = true;
+
+  try {
+    const customName = req.body?.name || req.body?.eventName;
+
+    const result = await db.transaction(async (tx) => {
+      // 1. Obtain current/latest event
+      const latestEventRes = await tx.query('SELECT * FROM events ORDER BY created_at DESC LIMIT 1');
+      const previousEvent = latestEventRes.rows[0] || null;
+      const previousEventId = previousEvent?.id || null;
+      const previousEventName = previousEvent?.name || 'CLUE QUEST 2026 - ECE Championship';
+      const maxPlayers = previousEvent?.max_players || 40;
+
+      // Protection against rapid duplicate requests
+      if (previousEvent && previousEvent.status === 'WAITING') {
+        const regCountRes = await tx.query("SELECT COUNT(*) as count FROM users WHERE role = 'PLAYER' AND team_name IS NOT NULL");
+        const regCount = parseInt(regCountRes.rows[0]?.count || '0', 10);
+        const elapsedMs = Date.now() - new Date(previousEvent.created_at).getTime();
+
+        if (regCount === 0 && elapsedMs < 5000) {
+          throw new Error('Next event was already prepared moments ago. Duplicate request ignored.');
+        }
+      }
+
+      // 2. Generate unique new event ID and sequential name
+      const newEventId = `evt_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const newEventName = generateNextEventName(previousEventName, customName);
+      const now = new Date().toISOString();
+
+      // 3. Create new event row
+      await tx.query(`
+        INSERT INTO events (id, name, status, max_players, countdown_started_at, started_at, completed_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `, [newEventId, newEventName, 'WAITING', maxPlayers, null, null, null, now]);
+
+      const newEvent = {
+        id: newEventId,
+        name: newEventName,
+        status: 'WAITING',
+        max_players: maxPlayers,
+        countdown_started_at: null,
+        started_at: null,
+        completed_at: null,
+        created_at: now,
+      };
+
+      // 4. Clear ONLY participant registration state (CQ001 - CQ040)
+      const clearRes = await tx.query(`
+        UPDATE users
+        SET
+          team_name = NULL,
+          display_name = 'Participant ' || SUBSTRING(player_code FROM 4) || ' (ECE)',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE role = 'PLAYER'
+      `);
+
+      const clearedCount = clearRes.rowCount || 40;
+
+      // 5. Add audit log
+      const logId = `log_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const auditMetadata = {
+        previous_event_id: previousEventId,
+        new_event_id: newEventId,
+        cleared_participant_slots: clearedCount,
+        initiated_by: req.user?.player_code || req.user?.id || 'admin',
+        timestamp: now,
+      };
+
+      await tx.query(`
+        INSERT INTO event_logs (id, event_id, user_id, action, metadata, created_at)
+        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+      `, [logId, newEventId, req.user?.id || null, 'PREPARE_NEXT_EVENT', JSON.stringify(auditMetadata)]);
+
+      return {
+        previous_event_id: previousEventId,
+        new_event_id: newEventId,
+        event: newEvent,
+        cleared_participant_slots: clearedCount,
+      };
+    });
+
+    res.json({
+      success: true,
+      message: `New event "${result.event.name}" prepared successfully. Participant slots cleared and available for registration.`,
+      ...result,
+    });
+  } catch (err: any) {
+    console.error('Prepare next event error:', err);
+    res.status(400).json({ error: err.message || 'Failed to prepare next event' });
+  } finally {
+    isPreparingNextEvent = false;
+  }
+}
+
+adminRouter.post('/events/prepare-next', handlePrepareNextEvent);
+adminRouter.post('/event/prepare-next', handlePrepareNextEvent);
+
 // Helper: Parse CSV into Rows
 function parseCSV(csvText: string): string[][] {
   const rows: string[][] = [];

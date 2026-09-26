@@ -94,6 +94,38 @@ export const AdminDashboardPage: React.FC = () => {
     }
   };
 
+  const handlePrepareNextEvent = async (customName?: string) => {
+    try {
+      setActionLoading(true);
+      setMessage(null);
+      const res = await request<{
+        success: boolean;
+        message: string;
+        previous_event_id: string;
+        new_event_id: string;
+        event: any;
+        cleared_participant_slots: number;
+        details?: string[];
+      }>('/admin/events/prepare-next', {
+        method: 'POST',
+        body: JSON.stringify({ name: customName }),
+      });
+      setMessage({
+        type: 'success',
+        text: res.message || `New event "${res.event?.name}" prepared successfully. 40 participant slots cleared for registration.`,
+      });
+      await refreshAll();
+    } catch (err: any) {
+      setMessage({
+        type: 'error',
+        text: err.message || 'Failed to prepare next event',
+        details: err.data?.details || undefined,
+      });
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   const handleSaveQuestion = async (formData: any) => {
     try {
       setActionLoading(true);
@@ -207,6 +239,7 @@ export const AdminDashboardPage: React.FC = () => {
         <EventController
           event={overview.event}
           onAction={handleEventAction}
+          onPrepareNextEvent={handlePrepareNextEvent}
           isLoading={actionLoading}
         />
 
