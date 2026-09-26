@@ -30,7 +30,9 @@ export function isAnswerMatch(
 
   const normCorrect = normalizeAnswer(correctAnswer);
 
-  if (normUser === normCorrect) return true;
+  if (normUser === normCorrect) {
+    return true;
+  }
 
   for (const alias of aliases) {
     if (normUser === normalizeAnswer(alias)) {
@@ -38,29 +40,41 @@ export function isAnswerMatch(
     }
   }
 
-  // Check plural/singular variations
-  if (normUser === normCorrect + 'S' || normUser + 'S' === normCorrect) {
+  // Singular / plural support
+  if (
+    normUser === normCorrect + 'S' ||
+    normUser + 'S' === normCorrect
+  ) {
     return true;
   }
 
   return false;
 }
 
-/**
- * Get existing participant session or create a new one.
- *
- * IMPORTANT:
- * The database automatically sets game_sessions.started_at
- * when a new session is created.
- *
- * Therefore every participant gets their own 20-minute timer.
- */
+
+/* =========================================================
+   GAME TIMER
+   ========================================================= */
+
+export const TEST_DURATION_SECONDS = 20 * 60;
+
+
+/* =========================================================
+   SESSION
+   ========================================================= */
+
 export async function getOrCreateGameSession(
   userId: string,
   eventId: string
 ) {
   const existing = await db.query(
-    'SELECT * FROM game_sessions WHERE user_id = $1 AND event_id = $2',
+    `
+      SELECT *
+      FROM game_sessions
+      WHERE user_id = $1
+        AND event_id = $2
+      LIMIT 1
+    `,
     [userId, eventId]
   );
 
@@ -68,7 +82,8 @@ export async function getOrCreateGameSession(
     return existing.rows[0];
   }
 
-  const sessionId = `sess_${userId.replace('usr_', '')}_${Date.now()}`;
+  const sessionId =
+    `sess_${userId.replace('usr_', '')}_${Date.now()}`;
 
   const insertRes = await db.query(
     `
@@ -82,7 +97,17 @@ export async function getOrCreateGameSession(
         current_question_value,
         total_score
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8
+      )
+      RETURNING *
     `,
     [
       sessionId,
@@ -96,6 +121,8 @@ export async function getOrCreateGameSession(
     ]
   );
 
+  const session = insertRes.rows[0];
+
   await logEventAction(
     'GAME_START',
     userId,
@@ -105,27 +132,57 @@ export async function getOrCreateGameSession(
     }
   );
 
-  return (
-    insertRes.rows[0] || {
-      id: sessionId,
-      event_id: eventId,
-      user_id: userId,
-      status: 'IN_PROGRESS',
-      current_question: 1,
-      current_clue_level: 1,
-      current_question_value: 100,
-      total_score: 0,
-    }
-  );
+  return session;
 }
 
-/**
- * Participant test duration.
- *
- * Each participant gets their own 20-minute timer.
- */
-export const TEST_DURATION_SECONDS = 20 * 60; // 1200 seconds
 
+/* =========================================================
+   SESSION + PARTICIPANT TIMER
+   ========================================================= */
+
+async function getSessionWithDeadline(
+  userId: string,
+  eventId: string
+) {
+  const session =
+    await getOrCreateGameSession(
+      userId,
+      eventId
+    );
+
+  let deadlineAt: string | null = null;
+  let isExpired = false;
+
+  if (session?.started_at) {
+    const startedTime =
+      new Date(
+        session.started_at
+      ).getTime();
+
+    const deadlineTime =
+      startedTime +
+      TEST_DURATION_SECONDS * 1000;
+
+    deadlineAt =
+      new Date(
+        deadlineTime
+      ).toISOString();
+
+    isExpired =
+      Date.now() >= deadlineTime;
+  }
+
+  return {
+    session,
+    deadlineAt,
+    isExpired,
+  };
+}
+
+
+/* =========================================================
+   INTEGRITY EVENT
+   ========================================================= */
 
 export async function recordIntegrityEvent(
   userId: string,
@@ -140,75 +197,110 @@ export async function recordIntegrityEvent(
     {
       type,
       ...metadata,
-      recorded_at: new Date().toISOString(),
+      recorded_at:
+        new Date().toISOString(),
     }
   );
 }
 
 
-/**
- * Get participant game state.
- *
- * TIMER LOGIC:
- * deadline = session.started_at + 20 minutes
- *
- * NOT:
- * deadline = event.started_at + 20 minutes
- *
- * This means:
- *
- * Participant A starts at 10:00 -> ends at 10:20
- * Participant B starts at 10:05 -> ends at 10:25
- * Participant C starts at 10:12 -> ends at 10:32
- */
+/* =========================================================
+   FAST CURRENT GAME STATE
+   =========================================================
+   
+   One SQL query gets:
+   - current question
+   - unlocked clues
+   - existing attempt
+
+   This avoids multiple sequential DB round trips.
+   ========================================================= */
+
+async function getCurrentQuestionState(
+  session: any
+) {
+  const result = await db.query(
+    `
+      SELECT
+        q.id,
+        q.question_number,
+        q.question_text,
+        q.category,
+        q.is_active,
+
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', c.id,
+                'level', c.level,
+                'clue_text', c.clue_text,
+                'points', c.points
+              )
+              ORDER BY c.level ASC
+            )
+            FROM clues c
+            WHERE c.question_id = q.id
+              AND c.level <= $2
+          ),
+          '[]'::json
+        ) AS unlocked_clues,
+
+        (
+          SELECT row_to_json(qa)
+          FROM question_attempts qa
+          WHERE qa.session_id = $3
+            AND qa.question_id = q.id
+          LIMIT 1
+        ) AS attempt
+
+      FROM questions q
+
+      WHERE q.question_number = $1
+        AND q.is_active = true
+
+      LIMIT 1
+    `,
+    [
+      session.current_question,
+      session.current_clue_level,
+      session.id,
+    ]
+  );
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  return result.rows[0];
+}
+
+
+/* =========================================================
+   PLAYER GAME STATE
+   ========================================================= */
+
 export async function getPlayerGameState(
   userId: string,
   eventId: string,
   eventStatus: string = 'LIVE'
 ) {
-  const session = await getOrCreateGameSession(
-    userId,
-    eventId
-  );
+  const {
+    session,
+    deadlineAt,
+    isExpired,
+  } =
+    await getSessionWithDeadline(
+      userId,
+      eventId
+    );
 
-  // Fetch current event
-  const eventRes = await db.query(
-    'SELECT * FROM events WHERE id = $1',
-    [eventId]
-  );
+  const serverNow =
+    new Date().toISOString();
 
-  const event = eventRes.rows[0] || null;
 
-  let deadlineAt: string | null = null;
-  const serverNow = new Date().toISOString();
-  let isExpired = false;
-
-  /**
-   * IMPORTANT:
-   * Timer is calculated from THIS participant's
-   * session.started_at.
-   */
-  if (session && session.started_at) {
-    const startedTime = new Date(
-      session.started_at
-    ).getTime();
-
-    const deadlineTime =
-      startedTime +
-      TEST_DURATION_SECONDS * 1000;
-
-    deadlineAt = new Date(
-      deadlineTime
-    ).toISOString();
-
-    if (Date.now() >= deadlineTime) {
-      isExpired = true;
-    }
-  }
-
-  /**
-   * If event is not LIVE or PAUSED,
-   * never send question content.
+  /*
+   * Do not expose questions before event is LIVE.
    */
   if (
     eventStatus !== 'LIVE' &&
@@ -226,9 +318,9 @@ export async function getPlayerGameState(
     };
   }
 
-  /**
-   * If THIS participant's 20-minute timer expired,
-   * complete ONLY THIS participant's session.
+
+  /*
+   * Participant's own 20-minute timer expired.
    */
   if (
     isExpired &&
@@ -254,37 +346,46 @@ export async function getPlayerGameState(
       eventId,
       {
         session_id: session.id,
-        score: session.total_score,
+        score:
+          session.total_score || 0,
       }
     );
   }
 
-  /**
-   * Get current question.
-   */
-  const qRes = await db.query(
-    `
-      SELECT
-        id,
-        question_number,
-        question_text,
-        category,
-        is_active
-      FROM questions
-      WHERE question_number = $1
-        AND is_active = true
-    `,
-    [session.current_question]
-  );
 
-  /**
-   * No question / expired / completed.
+  /*
+   * Do not continue for completed session.
    */
   if (
-    qRes.rows.length === 0 ||
-    isExpired ||
     session.status === 'COMPLETED'
   ) {
+    return {
+      session,
+      question: null,
+      unlocked_clues: [],
+      already_attempted: null,
+      total_questions: 20,
+      deadline_at: deadlineAt,
+      server_now: serverNow,
+      is_expired: isExpired,
+    };
+  }
+
+
+  /*
+   * One query:
+   * question + clues + attempt
+   */
+  const current =
+    await getCurrentQuestionState(
+      session
+    );
+
+
+  /*
+   * No active question.
+   */
+  if (!current) {
     if (
       session.status !== 'COMPLETED'
     ) {
@@ -300,7 +401,8 @@ export async function getPlayerGameState(
         [session.id]
       );
 
-      session.status = 'COMPLETED';
+      session.status =
+        'COMPLETED';
     }
 
     return {
@@ -315,147 +417,98 @@ export async function getPlayerGameState(
     };
   }
 
-  const rawQ = qRes.rows[0];
+
+  /*
+   * Expired.
+   */
+  if (isExpired) {
+    return {
+      session,
+      question: null,
+      unlocked_clues: [],
+      already_attempted: null,
+      total_questions: 20,
+      deadline_at: deadlineAt,
+      server_now: serverNow,
+      is_expired: true,
+    };
+  }
+
 
   const question = {
-    id: rawQ.id,
-    question_number: rawQ.question_number,
-    question_text: rawQ.question_text,
-    category: rawQ.category,
-    is_active: rawQ.is_active,
+    id: current.id,
+    question_number:
+      current.question_number,
+    question_text:
+      current.question_text,
+    category:
+      current.category,
+    is_active:
+      current.is_active,
   };
 
-  /**
-   * Fetch ONLY unlocked clues.
-   */
-  const cluesRes = await db.query(
-    `
-      SELECT
-        id,
-        level,
-        clue_text,
-        points
-      FROM clues
-      WHERE question_id = $1
-        AND level <= $2
-      ORDER BY level ASC
-    `,
-    [
-      question.id,
-      session.current_clue_level,
-    ]
-  );
-
-  /**
-   * Check if current question was already attempted.
-   */
-  const attemptRes = await db.query(
-    `
-      SELECT
-        id,
-        session_id,
-        question_id,
-        highest_clue_level,
-        final_question_value,
-        user_answer,
-        correct_answer,
-        is_correct,
-        earned_points,
-        submitted_at
-      FROM question_attempts
-      WHERE session_id = $1
-        AND question_id = $2
-    `,
-    [
-      session.id,
-      question.id,
-    ]
-  );
-
-  const attempt =
-    attemptRes.rows.length > 0
-      ? attemptRes.rows[0]
-      : null;
 
   return {
     session,
     question,
-    unlocked_clues: cluesRes.rows,
-    already_attempted: attempt,
+    unlocked_clues:
+      current.unlocked_clues || [],
+    already_attempted:
+      current.attempt || null,
     total_questions: 20,
     deadline_at: deadlineAt,
     server_now: serverNow,
-    is_expired: isExpired,
+    is_expired: false,
   };
 }
 
 
-/**
- * Check participant-specific deadline.
- *
- * IMPORTANT:
- * This function no longer checks events.started_at.
- *
- * It checks:
- *
- * game_sessions.started_at + 20 minutes
- */
+/* =========================================================
+   DEADLINE CHECK
+   ========================================================= */
+
 export async function checkEventDeadline(
   userId: string,
   eventId: string
 ) {
-  /**
-   * Get/create THIS participant's session.
-   */
-  const session = await getOrCreateGameSession(
-    userId,
-    eventId
-  );
-
-  if (
-    !session ||
-    !session.started_at
-  ) {
-    return {
-      isExpired: false,
-      deadlineAt: null,
-    };
-  }
-
-  const startedTime = new Date(
-    session.started_at
-  ).getTime();
-
-  const deadlineTime =
-    startedTime +
-    TEST_DURATION_SECONDS * 1000;
-
-  const isExpired =
-    Date.now() >= deadlineTime;
+  const {
+    deadlineAt,
+    isExpired,
+  } =
+    await getSessionWithDeadline(
+      userId,
+      eventId
+    );
 
   return {
     isExpired,
-    deadlineAt: new Date(
-      deadlineTime
-    ).toISOString(),
+    deadlineAt,
   };
 }
 
 
-/**
- * Reveal next clue.
- */
+/* =========================================================
+   REVEAL NEXT CLUE
+   ========================================================= */
+
 export async function revealNextClue(
   userId: string,
   eventId: string,
   requestedLevel?: number
 ) {
+  /*
+   * IMPORTANT:
+   * Get session + timer only ONCE.
+   */
   const {
+    session,
     isExpired,
-  } = await checkEventDeadline(
-    userId,
-    eventId
-  );
+  } =
+    await getSessionWithDeadline(
+      userId,
+      eventId
+    );
+
 
   if (isExpired) {
     throw new Error(
@@ -463,11 +516,6 @@ export async function revealNextClue(
     );
   }
 
-  const session =
-    await getOrCreateGameSession(
-      userId,
-      eventId
-    );
 
   if (
     session.status === 'COMPLETED'
@@ -477,6 +525,7 @@ export async function revealNextClue(
     );
   }
 
+
   if (
     session.current_clue_level >= 4
   ) {
@@ -485,11 +534,13 @@ export async function revealNextClue(
     );
   }
 
+
   const nextLevel =
     session.current_clue_level + 1;
 
-  /**
-   * Prevent race condition skipping.
+
+  /*
+   * Prevent skipping clue levels.
    */
   if (
     requestedLevel &&
@@ -500,8 +551,9 @@ export async function revealNextClue(
     );
   }
 
-  /**
-   * Verify question exists.
+
+  /*
+   * Get current question.
    */
   const qRes = await db.query(
     `
@@ -509,9 +561,11 @@ export async function revealNextClue(
       FROM questions
       WHERE question_number = $1
         AND is_active = true
+      LIMIT 1
     `,
     [session.current_question]
   );
+
 
   if (
     qRes.rows.length === 0
@@ -521,21 +575,29 @@ export async function revealNextClue(
     );
   }
 
-  /**
-   * Verify question has not already been submitted.
+
+  const questionId =
+    qRes.rows[0].id;
+
+
+  /*
+   * Check existing attempt.
    */
-  const attemptRes = await db.query(
-    `
-      SELECT id
-      FROM question_attempts
-      WHERE session_id = $1
-        AND question_id = $2
-    `,
-    [
-      session.id,
-      qRes.rows[0].id,
-    ]
-  );
+  const attemptRes =
+    await db.query(
+      `
+        SELECT id
+        FROM question_attempts
+        WHERE session_id = $1
+          AND question_id = $2
+        LIMIT 1
+      `,
+      [
+        session.id,
+        questionId,
+      ]
+    );
+
 
   if (
     attemptRes.rows.length > 0
@@ -545,11 +607,13 @@ export async function revealNextClue(
     );
   }
 
+
   const nextValue =
     CLUE_POINT_VALUES[nextLevel];
 
-  /**
-   * Atomic update.
+
+  /*
+   * Update session.
    */
   await db.query(
     `
@@ -567,12 +631,17 @@ export async function revealNextClue(
     ]
   );
 
+
   session.current_clue_level =
     nextLevel;
 
   session.current_question_value =
     nextValue;
 
+
+  /*
+   * Audit.
+   */
   await logEventAction(
     'CLUE_REVEALED',
     userId,
@@ -586,6 +655,10 @@ export async function revealNextClue(
     }
   );
 
+
+  /*
+   * Return fresh state.
+   */
   return getPlayerGameState(
     userId,
     eventId,
@@ -594,20 +667,27 @@ export async function revealNextClue(
 }
 
 
-/**
- * Submit answer.
- */
+/* =========================================================
+   SUBMIT ANSWER
+   ========================================================= */
+
 export async function submitQuestionAnswer(
   userId: string,
   eventId: string,
   rawUserAnswer: string
 ) {
+  /*
+   * Session + timer only once.
+   */
   const {
+    session,
     isExpired,
-  } = await checkEventDeadline(
-    userId,
-    eventId
-  );
+  } =
+    await getSessionWithDeadline(
+      userId,
+      eventId
+    );
+
 
   if (isExpired) {
     throw new Error(
@@ -615,11 +695,6 @@ export async function submitQuestionAnswer(
     );
   }
 
-  const session =
-    await getOrCreateGameSession(
-      userId,
-      eventId
-    );
 
   if (
     session.status === 'COMPLETED'
@@ -629,7 +704,8 @@ export async function submitQuestionAnswer(
     );
   }
 
-  /**
+
+  /*
    * Get current question.
    */
   const qRes = await db.query(
@@ -638,9 +714,11 @@ export async function submitQuestionAnswer(
       FROM questions
       WHERE question_number = $1
         AND is_active = true
+      LIMIT 1
     `,
     [session.current_question]
   );
+
 
   if (
     qRes.rows.length === 0
@@ -650,11 +728,13 @@ export async function submitQuestionAnswer(
     );
   }
 
+
   const question =
     qRes.rows[0];
 
-  /**
-   * Atomic idempotency check.
+
+  /*
+   * Duplicate submission check.
    */
   const existingAttempt =
     await db.query(
@@ -663,12 +743,14 @@ export async function submitQuestionAnswer(
         FROM question_attempts
         WHERE session_id = $1
           AND question_id = $2
+        LIMIT 1
       `,
       [
         session.id,
         question.id,
       ]
     );
+
 
   if (
     existingAttempt.rows.length > 0
@@ -678,16 +760,19 @@ export async function submitQuestionAnswer(
     );
   }
 
+
   const normalizedInput =
     normalizeAnswer(
       rawUserAnswer
     );
+
 
   if (!normalizedInput) {
     throw new Error(
       'Please enter a valid answer.'
     );
   }
+
 
   const aliases =
     Array.isArray(
@@ -703,6 +788,7 @@ export async function submitQuestionAnswer(
           : []
       );
 
+
   const isCorrect =
     isAnswerMatch(
       normalizedInput,
@@ -710,16 +796,19 @@ export async function submitQuestionAnswer(
       aliases
     );
 
+
   const earnedPoints =
     isCorrect
       ? session.current_question_value
       : 0;
 
+
   const attemptId =
     `att_${session.id}_q${question.question_number}_${Date.now()}`;
 
-  /**
-   * Insert attempt.
+
+  /*
+   * Insert answer.
    */
   await db.query(
     `
@@ -759,12 +848,14 @@ export async function submitQuestionAnswer(
     ]
   );
 
-  /**
-   * Update session score.
+
+  /*
+   * Update score.
    */
   const newTotal =
     (session.total_score || 0) +
     earnedPoints;
+
 
   await db.query(
     `
@@ -780,9 +871,14 @@ export async function submitQuestionAnswer(
     ]
   );
 
+
   session.total_score =
     newTotal;
 
+
+  /*
+   * Audit.
+   */
   await logEventAction(
     'ANSWER_SUBMITTED',
     userId,
@@ -795,11 +891,15 @@ export async function submitQuestionAnswer(
         session.current_clue_level,
       question_value:
         session.current_question_value,
-      is_correct: isCorrect,
-      earned_points: earnedPoints,
-      new_total_score: newTotal,
+      is_correct:
+        isCorrect,
+      earned_points:
+        earnedPoints,
+      new_total_score:
+        newTotal,
     }
   );
+
 
   return {
     is_correct: isCorrect,
@@ -815,19 +915,26 @@ export async function submitQuestionAnswer(
 }
 
 
-/**
- * Move to next question.
- */
+/* =========================================================
+   NEXT QUESTION
+   ========================================================= */
+
 export async function advanceToNextQuestion(
   userId: string,
   eventId: string
 ) {
+  /*
+   * Session + timer only once.
+   */
   const {
+    session,
     isExpired,
-  } = await checkEventDeadline(
-    userId,
-    eventId
-  );
+  } =
+    await getSessionWithDeadline(
+      userId,
+      eventId
+    );
+
 
   if (isExpired) {
     throw new Error(
@@ -835,11 +942,6 @@ export async function advanceToNextQuestion(
     );
   }
 
-  const session =
-    await getOrCreateGameSession(
-      userId,
-      eventId
-    );
 
   if (
     session.status === 'COMPLETED'
@@ -850,8 +952,9 @@ export async function advanceToNextQuestion(
     };
   }
 
-  /**
-   * Ensure current question was answered.
+
+  /*
+   * Get current question ID.
    */
   const qRes = await db.query(
     `
@@ -859,10 +962,15 @@ export async function advanceToNextQuestion(
       FROM questions
       WHERE question_number = $1
         AND is_active = true
+      LIMIT 1
     `,
     [session.current_question]
   );
 
+
+  /*
+   * Ensure answer exists.
+   */
   if (
     qRes.rows.length > 0
   ) {
@@ -873,12 +981,14 @@ export async function advanceToNextQuestion(
           FROM question_attempts
           WHERE session_id = $1
             AND question_id = $2
+          LIMIT 1
         `,
         [
           session.id,
           qRes.rows[0].id,
         ]
       );
+
 
     if (
       attempt.rows.length === 0
@@ -889,11 +999,13 @@ export async function advanceToNextQuestion(
     }
   }
 
+
   const nextQuestionNum =
     session.current_question + 1;
 
-  /**
-   * Finish game after question 20.
+
+  /*
+   * Finish after Q20.
    */
   if (
     nextQuestionNum > 20
@@ -910,8 +1022,10 @@ export async function advanceToNextQuestion(
       [session.id]
     );
 
+
     session.status =
       'COMPLETED';
+
 
     await logEventAction(
       'GAME_COMPLETED',
@@ -924,14 +1038,16 @@ export async function advanceToNextQuestion(
       }
     );
 
+
     return {
       session,
       is_complete: true,
     };
   }
 
-  /**
-   * Reset clue level for next question.
+
+  /*
+   * Move to next question.
    */
   await db.query(
     `
@@ -949,6 +1065,7 @@ export async function advanceToNextQuestion(
     ]
   );
 
+
   session.current_question =
     nextQuestionNum;
 
@@ -957,6 +1074,7 @@ export async function advanceToNextQuestion(
 
   session.current_question_value =
     100;
+
 
   await logEventAction(
     'QUESTION_COMPLETED',
@@ -969,6 +1087,7 @@ export async function advanceToNextQuestion(
     }
   );
 
+
   return {
     session,
     is_complete: false,
@@ -976,9 +1095,10 @@ export async function advanceToNextQuestion(
 }
 
 
-/**
- * Get final game results.
- */
+/* =========================================================
+   RESULTS
+   ========================================================= */
+
 export async function getGameResultsSummary(
   userId: string,
   eventId: string
@@ -988,6 +1108,7 @@ export async function getGameResultsSummary(
       userId,
       eventId
     );
+
 
   const attemptsRes =
     await db.query(
@@ -1006,8 +1127,10 @@ export async function getGameResultsSummary(
       [session.id]
     );
 
+
   const attempts =
     attemptsRes.rows;
+
 
   let correctCount = 0;
   let incorrectCount = 0;
@@ -1018,14 +1141,19 @@ export async function getGameResultsSummary(
   let count50 = 0;
   let count25 = 0;
 
+
   for (const a of attempts) {
     totalCluesUsed +=
       a.highest_clue_level;
 
+
     if (a.is_correct) {
       correctCount++;
 
-      if (a.earned_points === 100) {
+
+      if (
+        a.earned_points === 100
+      ) {
         count100++;
       } else if (
         a.earned_points === 75
@@ -1044,6 +1172,7 @@ export async function getGameResultsSummary(
       incorrectCount++;
     }
   }
+
 
   return {
     session,
