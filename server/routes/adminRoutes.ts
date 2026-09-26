@@ -168,7 +168,7 @@ adminRouter.get('/participant/:userId', async (req: AuthenticatedRequest, res: R
     const integrityLogs = logsRes.rows.map(r => {
       let meta = r.metadata;
       if (typeof meta === 'string') {
-        try { meta = JSON.parse(meta); } catch {}
+        try { meta = JSON.parse(meta); } catch { }
       }
       return {
         id: r.id,
@@ -237,7 +237,7 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
       // PRE-START VALIDATION
       const validationErrors: string[] = [];
       const qRes = await db.query('SELECT id, question_number, question_text, answer FROM questions WHERE is_active = true ORDER BY question_number ASC');
-      
+
       if (qRes.rows.length !== 20) {
         validationErrors.push(`Exactly 20 active questions are required (currently ${qRes.rows.length} found).`);
       }
@@ -290,7 +290,7 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
 
       const now = new Date().toISOString();
       await db.query(
-        "UPDATE events SET status = 'COUNTDOWN', countdown_started_at = $1 WHERE id = $2",
+        "UPDATE events SET status = 'COUNTDOWN', countdown_started_at = $1, started_at = NULL, completed_at = NULL WHERE id = $2",
         [now, event.id]
       );
 
@@ -437,7 +437,7 @@ adminRouter.post('/questions/import-csv', async (req: AuthenticatedRequest, res:
     // Header check
     const header = rows[0].map(h => h.toLowerCase().trim());
     const expectedHeaders = ['serial number', 'question', 'clue 1', 'clue 2', 'clue 3', 'clue 4', 'answer'];
-    
+
     // Find column indexes
     const snIdx = header.findIndex(h => h.includes('serial') || h === 'sn' || h === 'no' || h === '#');
     const qIdx = header.findIndex(h => h.includes('question') && !h.includes('clue'));
