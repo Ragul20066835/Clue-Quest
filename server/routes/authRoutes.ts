@@ -5,6 +5,11 @@ import { db } from '../db/client.js';
 import { config } from '../config.js';
 import { authenticate, AuthenticatedRequest } from '../middleware/auth.js';
 import { logEventAction } from '../services/auditService.js';
+import {
+  getActiveEventCached,
+  invalidateAuthUserCache,
+  setAuthUserCache,
+} from '../services/cacheService.js';
 
 export const authRouter = Router();
 
@@ -62,6 +67,16 @@ authRouter.post('/login', async (req: Request, res: Response): Promise<void> => 
       secure: config.isProduction,
       sameSite: 'lax',
       maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    // Prime process-local auth user cache
+    setAuthUserCache({
+      id: user.id,
+      player_code: user.player_code,
+      display_name: user.display_name,
+      team_name: user.team_name || null,
+      role: user.role,
+      is_active: Boolean(user.is_active),
     });
 
     await logEventAction('LOGIN', user.id, null, { player_code: user.player_code, role: user.role });
@@ -131,6 +146,16 @@ authRouter.post('/admin/login', async (req: Request, res: Response): Promise<voi
       maxAge: 24 * 60 * 60 * 1000,
     });
 
+    // Prime process-local auth user cache for admin
+    setAuthUserCache({
+      id: adminUser.id,
+      player_code: adminUser.player_code,
+      display_name: adminUser.display_name,
+      team_name: null,
+      role: 'ADMIN',
+      is_active: Boolean(adminUser.is_active),
+    });
+
     await logEventAction('ADMIN_LOGIN', adminUser.id, null, { username: adminUser.player_code });
 
     res.json({
@@ -189,9 +214,8 @@ authRouter.post('/team', async (req: Request, res: Response): Promise<void> => {
 
     const normTeam = validation.normalized;
 
-    // 1. Check current event state
-    const eventRes = await db.query('SELECT status, max_players FROM events ORDER BY created_at DESC LIMIT 1');
-    const event = eventRes.rows[0];
+    // 1. Check current event state from cache
+    const event = await getActiveEventCached();
     const eventStatus = event?.status || 'WAITING';
     const maxPlayers = event?.max_players || 40;
 
@@ -283,6 +307,16 @@ authRouter.post('/team', async (req: Request, res: Response): Promise<void> => {
       maxAge: 24 * 60 * 60 * 1000,
     });
 
+    // Update auth user cache with registered team info
+    setAuthUserCache({
+      id: user.id,
+      player_code: user.player_code,
+      display_name: user.display_name || normTeam,
+      team_name: user.team_name || normTeam,
+      role: 'PLAYER',
+      is_active: true,
+    });
+
     res.json({
       success: true,
       token,
@@ -310,9 +344,9 @@ authRouter.patch('/team', authenticate, async (req: AuthenticatedRequest, res: R
       return;
     }
 
-    // Check event status
-    const eventRes = await db.query('SELECT status FROM events ORDER BY created_at DESC LIMIT 1');
-    const eventStatus = eventRes.rows[0]?.status || 'WAITING';
+    // Check event status from cache
+    const event = await getActiveEventCached();
+    const eventStatus = event?.status || 'WAITING';
     if (eventStatus !== 'WAITING') {
       res.status(400).json({ error: 'Team name changes are disabled after the event begins.' });
       return;
@@ -341,6 +375,17 @@ authRouter.patch('/team', authenticate, async (req: AuthenticatedRequest, res: R
       'UPDATE users SET team_name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
       [validation.normalized, user.id]
     );
+
+    // Invalidate and update cached auth user
+    invalidateAuthUserCache(user.id);
+    setAuthUserCache({
+      id: user.id,
+      player_code: user.player_code,
+      display_name: user.display_name,
+      team_name: validation.normalized,
+      role: user.role,
+      is_active: true,
+    });
 
     await logEventAction('TEAM_UPDATED', user.id, null, {
       player_code: user.player_code,
@@ -373,6 +418,7 @@ authRouter.get('/me', authenticate, async (req: AuthenticatedRequest, res: Respo
 
 authRouter.post('/logout', authenticate, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   if (req.user) {
+    invalidateAuthUserCache(req.user.id);
     await logEventAction('LOGOUT', req.user.id, null, { player_code: req.user.player_code });
   }
   res.clearCookie('cq_auth_token');

@@ -1,5 +1,6 @@
 import { db } from '../db/client.js';
 import { logEventAction } from './auditService.js';
+import { getQuestionByNumberCached } from './cacheService.js';
 
 export const CLUE_POINT_VALUES: Record<number, number> = {
   1: 100,
@@ -219,60 +220,43 @@ export async function recordIntegrityEvent(
 async function getCurrentQuestionState(
   session: any
 ) {
-  const result = await db.query(
-    `
-      SELECT
-        q.id,
-        q.question_number,
-        q.question_text,
-        q.category,
-        q.is_active,
-
-        COALESCE(
-          (
-            SELECT json_agg(
-              json_build_object(
-                'id', c.id,
-                'level', c.level,
-                'clue_text', c.clue_text,
-                'points', c.points
-              )
-              ORDER BY c.level ASC
-            )
-            FROM clues c
-            WHERE c.question_id = q.id
-              AND c.level <= $2
-          ),
-          '[]'::json
-        ) AS unlocked_clues,
-
-        (
-          SELECT row_to_json(qa)
-          FROM question_attempts qa
-          WHERE qa.session_id = $3
-            AND qa.question_id = q.id
-          LIMIT 1
-        ) AS attempt
-
-      FROM questions q
-
-      WHERE q.question_number = $1
-        AND q.is_active = true
-
-      LIMIT 1
-    `,
-    [
-      session.current_question,
-      session.current_clue_level,
-      session.id,
-    ]
-  );
-
-  if (result.rows.length === 0) {
+  const cachedQ = await getQuestionByNumberCached(session.current_question);
+  if (!cachedQ || !cachedQ.is_active) {
     return null;
   }
 
-  return result.rows[0];
+  const unlockedClues = cachedQ.clues
+    .filter((c) => c.level <= session.current_clue_level)
+    .map((c) => ({
+      id: c.id,
+      level: c.level,
+      clue_text: c.clue_text,
+      points: c.points,
+    }))
+    .sort((a, b) => a.level - b.level);
+
+  const attemptRes = await db.query(
+    `
+      SELECT *
+      FROM question_attempts
+      WHERE session_id = $1
+        AND question_id = $2
+      LIMIT 1
+    `,
+    [session.id, cachedQ.id]
+  );
+
+  const attempt = attemptRes.rows.length > 0 ? attemptRes.rows[0] : null;
+
+  return {
+    id: cachedQ.id,
+    question_number: cachedQ.question_number,
+    question_text: cachedQ.question_text,
+    category: cachedQ.category,
+    is_active: cachedQ.is_active,
+    unlocked_clues: unlockedClues,
+    attempt: attempt,
+  };
 }
 
 
@@ -553,31 +537,20 @@ export async function revealNextClue(
 
 
   /*
-   * Get current question.
+   * Get current question from cache.
    */
-  const qRes = await db.query(
-    `
-      SELECT id
-      FROM questions
-      WHERE question_number = $1
-        AND is_active = true
-      LIMIT 1
-    `,
-    [session.current_question]
-  );
-
+  const question = await getQuestionByNumberCached(session.current_question);
 
   if (
-    qRes.rows.length === 0
+    !question || !question.is_active
   ) {
     throw new Error(
       'Question not found'
     );
   }
 
-
   const questionId =
-    qRes.rows[0].id;
+    question.id;
 
 
   /*
@@ -706,31 +679,17 @@ export async function submitQuestionAnswer(
 
 
   /*
-   * Get current question.
+   * Get current question from cache.
    */
-  const qRes = await db.query(
-    `
-      SELECT *
-      FROM questions
-      WHERE question_number = $1
-        AND is_active = true
-      LIMIT 1
-    `,
-    [session.current_question]
-  );
-
+  const question = await getQuestionByNumberCached(session.current_question);
 
   if (
-    qRes.rows.length === 0
+    !question || !question.is_active
   ) {
     throw new Error(
       'Active question not found'
     );
   }
-
-
-  const question =
-    qRes.rows[0];
 
 
   /*
@@ -954,25 +913,15 @@ export async function advanceToNextQuestion(
 
 
   /*
-   * Get current question ID.
+   * Get current question ID from cache.
    */
-  const qRes = await db.query(
-    `
-      SELECT id
-      FROM questions
-      WHERE question_number = $1
-        AND is_active = true
-      LIMIT 1
-    `,
-    [session.current_question]
-  );
-
+  const question = await getQuestionByNumberCached(session.current_question);
 
   /*
    * Ensure answer exists.
    */
   if (
-    qRes.rows.length > 0
+    question
   ) {
     const attempt =
       await db.query(
@@ -985,7 +934,7 @@ export async function advanceToNextQuestion(
         `,
         [
           session.id,
-          qRes.rows[0].id,
+          question.id,
         ]
       );
 

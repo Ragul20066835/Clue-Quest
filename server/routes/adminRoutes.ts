@@ -3,6 +3,13 @@ import { authenticate, requireAdmin, AuthenticatedRequest } from '../middleware/
 import { db } from '../db/client.js';
 import { logEventAction } from '../services/auditService.js';
 import { checkAndAdvanceCountdown } from './eventRoutes.js';
+import {
+  getActiveEventCached,
+  setActiveEventCache,
+  invalidateActiveEventCache,
+  invalidateQuestionBankCache,
+  invalidateAuthUserCache,
+} from '../services/cacheService.js';
 
 export const adminRouter = Router();
 
@@ -13,9 +20,11 @@ adminRouter.use(requireAdmin);
 // 1. Get Event Control Status & Participant Matrix
 adminRouter.get('/overview', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const eventRes = await db.query('SELECT * FROM events ORDER BY created_at DESC LIMIT 1');
-    let event = eventRes.rows[0];
-    event = await checkAndAdvanceCountdown(event);
+    let event = await getActiveEventCached();
+    if (!event) {
+      res.status(404).json({ error: 'Event not found' });
+      return;
+    }
 
     let countdownRemainingSeconds: number | null = null;
     if (event.status === 'COUNTDOWN' && event.countdown_started_at) {
@@ -138,8 +147,11 @@ adminRouter.get('/participant/:userId', async (req: AuthenticatedRequest, res: R
     }
 
     const player = userRes.rows[0];
-    const eventRes = await db.query('SELECT id, status FROM events ORDER BY created_at DESC LIMIT 1');
-    const event = eventRes.rows[0];
+    const event = await getActiveEventCached();
+    if (!event) {
+      res.status(404).json({ error: 'Event not found' });
+      return;
+    }
 
     const sessRes = await db.query(
       'SELECT * FROM game_sessions WHERE user_id = $1 AND event_id = $2',
@@ -220,13 +232,11 @@ adminRouter.get('/participant/:userId', async (req: AuthenticatedRequest, res: R
 adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { action } = req.body;
-    const eventRes = await db.query('SELECT * FROM events ORDER BY created_at DESC LIMIT 1');
-    if (eventRes.rows.length === 0) {
+    let event = await getActiveEventCached();
+    if (!event) {
       res.status(404).json({ error: 'Event not found' });
       return;
     }
-    let event = eventRes.rows[0];
-    event = await checkAndAdvanceCountdown(event);
 
     if (action === 'START' || action === 'START_NOW') {
       if (event.status !== 'WAITING') {
@@ -293,6 +303,11 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
         "UPDATE events SET status = 'COUNTDOWN', countdown_started_at = $1, started_at = NULL, completed_at = NULL WHERE id = $2",
         [now, event.id]
       );
+      event.status = 'COUNTDOWN';
+      event.countdown_started_at = now;
+      event.started_at = null;
+      event.completed_at = null;
+      setActiveEventCache(event);
 
       await logEventAction('EVENT_START', req.user?.id, event.id, { timestamp: now, initiated_by: req.user?.player_code });
       res.json({
@@ -310,6 +325,8 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
         return;
       }
       await db.query("UPDATE events SET status = 'PAUSED' WHERE id = $1", [event.id]);
+      event.status = 'PAUSED';
+      setActiveEventCache(event);
       await logEventAction('ADMIN_EVENT_PAUSED', req.user?.id, event.id);
       res.json({ success: true, message: 'Event paused.', status: 'PAUSED' });
       return;
@@ -321,6 +338,8 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
         return;
       }
       await db.query("UPDATE events SET status = 'LIVE' WHERE id = $1", [event.id]);
+      event.status = 'LIVE';
+      setActiveEventCache(event);
       await logEventAction('ADMIN_EVENT_RESUMED', req.user?.id, event.id);
       res.json({ success: true, message: 'Event resumed.', status: 'LIVE' });
       return;
@@ -329,6 +348,9 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
     if (action === 'END') {
       const now = new Date().toISOString();
       await db.query("UPDATE events SET status = 'ENDED', completed_at = $1 WHERE id = $2", [now, event.id]);
+      event.status = 'ENDED';
+      event.completed_at = now;
+      setActiveEventCache(event);
       await logEventAction('ADMIN_EVENT_ENDED', req.user?.id, event.id);
       res.json({ success: true, message: 'Event ended.', status: 'ENDED' });
       return;
@@ -342,6 +364,7 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
 
       if (req.body.reset_teams || req.body.resetTeams) {
         await db.query("UPDATE users SET team_name = NULL, display_name = 'Participant ' || SUBSTRING(player_code, 3) || ' (ECE)', updated_at = CURRENT_TIMESTAMP WHERE role = 'PLAYER'");
+        invalidateAuthUserCache();
       }
 
       if (!db.isNeon()) {
@@ -357,11 +380,13 @@ adminRouter.post('/event/control', async (req: AuthenticatedRequest, res: Respon
             }
           }
         }
-        event.status = 'WAITING';
-        event.countdown_started_at = null;
-        event.started_at = null;
-        event.completed_at = null;
       }
+
+      event.status = 'WAITING';
+      event.countdown_started_at = null;
+      event.started_at = null;
+      event.completed_at = null;
+      setActiveEventCache(event);
 
       await logEventAction('ADMIN_EVENT_RESET', req.user?.id, event.id);
       res.json({ success: true, message: 'Competition sessions reset to WAITING state.', status: 'WAITING' });
@@ -479,6 +504,10 @@ async function handlePrepareNextEvent(req: AuthenticatedRequest, res: Response):
         cleared_participant_slots: clearedCount,
       };
     });
+
+    // Immediately set new event as active in cache and clear cached auth users
+    setActiveEventCache(result.event as any);
+    invalidateAuthUserCache();
 
     res.json({
       success: true,
@@ -723,6 +752,9 @@ adminRouter.post('/questions/import-csv', async (req: AuthenticatedRequest, res:
       }
     }
 
+    // Invalidate static question bank cache so fresh questions load immediately
+    invalidateQuestionBankCache();
+
     await logEventAction('QUESTIONS_CSV_IMPORTED', req.user?.id, null, { count: 20 });
     res.json({
       success: true,
@@ -840,6 +872,8 @@ adminRouter.post('/questions/save', async (req: AuthenticatedRequest, res: Respo
       }
     }
 
+    invalidateQuestionBankCache();
+
     await logEventAction('QUESTION_UPDATED', req.user?.id, null, { question_id: qId, number: question_number });
     res.json({ success: true, message: 'Question saved successfully.', question_id: qId });
   } catch (err: any) {
@@ -853,6 +887,8 @@ adminRouter.delete('/questions/:id', async (req: AuthenticatedRequest, res: Resp
   try {
     const { id } = req.params;
     await db.query('DELETE FROM questions WHERE id = $1', [id]);
+    invalidateQuestionBankCache();
+
     await logEventAction('QUESTION_DELETED', req.user?.id, null, { question_id: id });
     res.json({ success: true, message: 'Question deleted.' });
   } catch (err: any) {

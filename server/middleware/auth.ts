@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
-import { db } from '../db/client.js';
+import { getAuthUserCached } from '../services/cacheService.js';
 
 export interface AuthUser {
   id: string;
@@ -36,21 +36,25 @@ export async function authenticate(req: AuthenticatedRequest, res: Response, nex
   }
 
   try {
+    // 1. Cryptographic JWT signature and expiration verification on every request
     const decoded = jwt.verify(token, config.jwtSecret) as { id: string; role: 'PLAYER' | 'ADMIN' };
-    const result = await db.query('SELECT id, player_code, display_name, team_name, role, is_active FROM users WHERE id = $1', [decoded.id]);
     
-    if (result.rows.length === 0 || !result.rows[0].is_active) {
+    // 2. Safe bounded cache lookup with fallback to PostgreSQL
+    const user = await getAuthUserCached(decoded.id);
+    
+    // 3. Reject non-existent or inactive/disabled accounts
+    if (!user || !user.is_active) {
       res.status(401).json({ error: 'User account not found or disabled' });
       return;
     }
 
-    const u = result.rows[0];
+    // 4. Populate request-scoped authenticated user
     req.user = {
-      id: u.id,
-      player_code: u.player_code,
-      display_name: u.display_name,
-      team_name: u.team_name || null,
-      role: u.role,
+      id: user.id,
+      player_code: user.player_code,
+      display_name: user.display_name,
+      team_name: user.team_name || null,
+      role: user.role,
     };
     next();
   } catch (err) {

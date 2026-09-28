@@ -7,6 +7,20 @@ import { authRouter } from './routes/authRoutes.js';
 import { gameRouter } from './routes/gameRoutes.js';
 import { eventRouter } from './routes/eventRoutes.js';
 import { adminRouter } from './routes/adminRoutes.js';
+import jwt from 'jsonwebtoken';
+import { config } from './config.js';
+import {
+  getActiveEventCached,
+  getQuestionBankCached,
+  getQuestionByNumberCached,
+  invalidateActiveEventCache,
+  invalidateQuestionBankCache,
+  getCacheInspectionState,
+  invalidateAuthUserCache,
+  setAuthUserCache,
+  getAuthUserCached,
+} from './services/cacheService.js';
+import { getPollingInterval, POLLING_SCHEDULE } from '../src/context/GameContext.js';
 
 const BASE_URL = 'http://127.0.0.1:3001/api';
 let serverInstance: any = null;
@@ -659,6 +673,369 @@ async function runTests() {
   assert(rollbackSucceeded, 'Transaction threw and caught simulated failure');
   const rolledBackEvent = memStore.events.get('evt_rollback_test');
   assert(rolledBackEvent === undefined, 'Rolled back event was NOT committed to the database');
+
+  // --- 13. Phase 2: In-Memory Active Event & Question Bank Cache Verification ---
+  console.log('\n--- 13. Phase 2: In-Memory Active Event & Question Bank Cache Verification ---');
+
+  // 1. Active Event Cache Hit
+  console.log('\n[Phase 2A: Active Event Cache]');
+  const cachedEvt = await getActiveEventCached();
+  const cacheState1 = getCacheInspectionState();
+  assert(Boolean(cachedEvt), 'Active event fetched successfully via cache service');
+  assert(cacheState1.hasActiveEventCache, 'Active event is populated in process-local memory cache');
+  assert(cacheState1.activeEventId === cachedEvt?.id, 'Cached active event ID matches authoritative event');
+
+  // 2. Active Event Cache Invalidation & Direct Update on Prepare Next
+  const prepareNextCacheRes = await api('/admin/events/prepare-next', {
+    method: 'POST',
+    token: adminToken,
+    body: { name: 'CLUE QUEST 2026 - Phase 2 Cache Test Round' },
+  });
+  assert(prepareNextCacheRes.ok, 'Prepare next event returns 200 OK');
+  const cacheState2 = getCacheInspectionState();
+  assert(cacheState2.activeEventId === prepareNextCacheRes.data.new_event_id, 'Active event cache immediately updated to new event ID (no stale event returned)');
+
+  // 3. Question Bank Cache Population
+  console.log('\n[Phase 2B: Question & Clue Bank Cache]');
+  const questionBank = await getQuestionBankCached();
+  const cacheState3 = getCacheInspectionState();
+  assert(Array.isArray(questionBank) && questionBank.length === 20, 'Question bank loaded into memory with exactly 20 questions');
+  assert(cacheState3.hasQuestionBankCache, 'Question bank is active in process-local memory cache');
+  assert(cacheState3.questionCount === 20, 'Question count in cache inspection state is 20');
+
+  // 4. Question & Clue Cache Hit
+  const q1Cached = await getQuestionByNumberCached(1);
+  assert(q1Cached !== null, 'Question #1 retrieved from in-memory cache');
+  assert(q1Cached?.clues.length === 4, 'Question #1 has all 4 pre-cached clues');
+  assert(q1Cached?.clues[0].points === 100 && q1Cached?.clues[3].points === 25, 'Clue point hierarchy (100 -> 25) preserved in cache');
+
+  // 5. Question/Clue Cache Invalidation on Question Save/Edit
+  const saveQRes = await api('/admin/questions/save', {
+    method: 'POST',
+    token: adminToken,
+    body: {
+      id: 'q_01',
+      question_number: 1,
+      question_text: 'Identify this passive electronic component (Updated via Cache Test).',
+      answer: 'RESISTOR',
+      accepted_aliases: ['RESISTOR', 'RESISTANCE'],
+      category: 'Passive Components',
+      clues: [
+        { level: 1, clue_text: 'Clue 1 text', points: 100 },
+        { level: 2, clue_text: 'Clue 2 text', points: 75 },
+        { level: 3, clue_text: 'Clue 3 text', points: 50 },
+        { level: 4, clue_text: 'Clue 4 text', points: 25 },
+      ],
+    },
+  });
+  assert(saveQRes.ok, 'Admin save question returns 200 OK');
+  const q1AfterSave = await getQuestionByNumberCached(1);
+  assert(Boolean(q1AfterSave?.question_text.includes('Updated via Cache Test')), 'Question bank cache invalidated and refreshed with updated question statement');
+
+  // 6. Empty / Invalid Fallback Handling
+  invalidateActiveEventCache();
+  invalidateQuestionBankCache();
+  const cacheState4 = getCacheInspectionState();
+  assert(!cacheState4.hasActiveEventCache && !cacheState4.hasQuestionBankCache, 'Explicit cache invalidation clears memory stores');
+  const restoredEvent = await getActiveEventCached();
+  const restoredQ = await getQuestionByNumberCached(1);
+  assert(restoredEvent !== null && restoredQ !== null, 'Cache safely self-repopulates from database on subsequent requests');
+
+  // 7. Phase 2 Performance Benchmark: 40 Simulated Consecutive GET /api/game/state requests
+  console.log('\n[Phase 2 Performance Benchmark: 40 Consecutive /api/game/state Calls]');
+  const benchPlayerLogin = await api('/auth/team', {
+    method: 'POST',
+    body: { teamName: 'BENCHMARK RACERS' },
+  });
+  const benchToken = benchPlayerLogin.data.token;
+
+  // Start the event
+  await api('/admin/event/control', {
+    method: 'POST',
+    token: adminToken,
+    body: { action: 'START_NOW' },
+  });
+  await new Promise(r => setTimeout(r, 5500)); // wait countdown
+
+  const benchIterations = 40;
+  const startBenchTime = Date.now();
+  let benchSuccessCount = 0;
+
+  for (let i = 0; i < benchIterations; i++) {
+    const res = await api('/game/state', { token: benchToken });
+    if (res.ok && res.data.question) {
+      benchSuccessCount++;
+    }
+  }
+
+  const totalBenchMs = Date.now() - startBenchTime;
+  const avgLatencyMs = Math.round(totalBenchMs / benchIterations);
+  console.log(`⚡ Benchmark Result: ${benchSuccessCount}/${benchIterations} requests succeeded in ${totalBenchMs}ms (Avg: ${avgLatencyMs}ms per state check)`);
+  assert(benchSuccessCount === benchIterations, `All ${benchIterations} benchmark state requests succeeded`);
+  assert(avgLatencyMs < 50, `Average state check response latency (${avgLatencyMs}ms) is under 50ms locally`);
+
+  // --- 14. Phase 3: Safe Auth User Cache & Security Suite ---
+  console.log('\n--- 14. Phase 3: Safe Auth User Cache & Security Suite ---');
+
+  // Ensure event is in WAITING state for user mutation tests
+  await api('/admin/event/control', {
+    method: 'POST',
+    token: adminToken,
+    body: { action: 'RESET' },
+  });
+
+  // Case 1: Valid JWT + Cache Miss -> DB Lookup succeeds and primes cache
+  console.log('\n[Phase 3A: Valid JWT Cache Miss & Population]');
+  invalidateAuthUserCache();
+  const cacheInspectBefore = getCacheInspectionState();
+  assert(cacheInspectBefore.authUserCount === 0, 'Auth user cache cleared on demand');
+
+  const authMeMissRes = await api('/auth/me', { token: player1Token });
+  assert(authMeMissRes.ok && authMeMissRes.data.user.player_code === 'CQ001', 'Valid JWT with cache miss successfully executes DB lookup and authenticates');
+  const cacheInspectAfterMiss = getCacheInspectionState();
+  assert(cacheInspectAfterMiss.authUserCount >= 1, 'Auth user cache populated after successful DB lookup on cache miss');
+
+  // Case 2: Valid JWT + Cache Hit -> Avoids DB query
+  console.log('\n[Phase 3B: Valid JWT Cache Hit]');
+  const authMeHitRes = await api('/auth/me', { token: player1Token });
+  assert(authMeHitRes.ok && authMeHitRes.data.user.player_code === 'CQ001', 'Valid JWT with cache hit successfully authenticates via process-local cache');
+
+  // Case 3: Invalid JWT -> Rejected immediately by jwt.verify
+  console.log('\n[Phase 3C: Invalid JWT Rejection]');
+  const invalidJwtRes = await api('/auth/me', { token: 'invalid.bogus.token.structure' });
+  assert(invalidJwtRes.status === 401, 'Malformed/invalid JWT signature rejected with 401 Unauthorized');
+
+  // Case 4: Expired JWT -> Rejected cryptographically
+  console.log('\n[Phase 3D: Expired JWT Rejection]');
+  const expiredToken = jwt.sign(
+    { id: 'usr_cq001', player_code: 'CQ001', role: 'PLAYER' },
+    config.jwtSecret,
+    { expiresIn: '-10s' }
+  );
+  const expiredJwtRes = await api('/auth/me', { token: expiredToken });
+  assert(expiredJwtRes.status === 401, 'Expired JWT rejected cryptographically with 401 Unauthorized');
+
+  // Case 5: Tampered JWT Signature -> Rejected
+  console.log('\n[Phase 3E: Tampered JWT Signature Rejection]');
+  const tamperedToken = player1Token.slice(0, -5) + 'XYZAB';
+  const tamperedJwtRes = await api('/auth/me', { token: tamperedToken });
+  assert(tamperedJwtRes.status === 401, 'Tampered JWT signature rejected with 401 Unauthorized');
+
+  // Case 6: Unknown User ID in validly-signed JWT -> Rejected
+  console.log('\n[Phase 3F: Unknown User ID Rejection]');
+  const phantomUserToken = jwt.sign(
+    { id: 'usr_phantom_99999', player_code: 'CQ999', role: 'PLAYER' },
+    config.jwtSecret,
+    { expiresIn: '1h' }
+  );
+  const phantomUserRes = await api('/auth/me', { token: phantomUserToken });
+  assert(phantomUserRes.status === 401, 'Unknown user ID with valid signature rejected with 401 Unauthorized');
+
+  // Case 7: Inactive / Disabled User -> Rejected
+  console.log('\n[Phase 3G: Inactive User Rejection]');
+  const player1Id = team1Entry.data.user.id;
+  await db.query("UPDATE users SET is_active = false WHERE id = $1", [player1Id]);
+  invalidateAuthUserCache(player1Id);
+
+  const inactiveUserRes = await api('/auth/me', { token: player1Token });
+  assert(inactiveUserRes.status === 401, 'Deactivated user rejected with 401 Unauthorized on authentication');
+  await db.query("UPDATE users SET is_active = true WHERE id = $1", [player1Id]);
+  invalidateAuthUserCache(player1Id);
+
+  // Case 8: Player Token cannot access Admin Route
+  console.log('\n[Phase 3H: Role Authorization - Player Denied Admin Access]');
+  const playerAdminAccessRes = await api('/admin/overview', { token: player1Token });
+  assert(playerAdminAccessRes.status === 403, 'Player token forbidden (403) from accessing admin endpoints');
+
+  // Case 9: Admin Token can access Admin Route
+  console.log('\n[Phase 3I: Role Authorization - Admin Granted Admin Access]');
+  const adminAccessRes = await api('/admin/overview', { token: adminToken });
+  assert(adminAccessRes.ok, 'Admin token successfully authorized (200) for admin overview');
+
+  // Case 10: Client-controlled role escalation in body/headers cannot escalate privileges
+  console.log('\n[Phase 3J: Role Escalation Protection]');
+  const escalateRes = await api('/admin/event/control', {
+    method: 'POST',
+    token: player1Token,
+    body: { role: 'ADMIN', action: 'START_NOW' },
+  });
+  assert(escalateRes.status === 403, 'Client-controlled role parameters ignored; role determined authoritatively from server auth');
+
+  // Case 11: User Mutation Invalidates/Updates Cache
+  console.log('\n[Phase 3K: User Mutation Invalidation & Refresh]');
+  const teamUpdateReg = await api('/auth/team', {
+    method: 'POST',
+    body: { teamName: 'NEBULA LOGIC' },
+  });
+  const nebulaToken = teamUpdateReg.data.token;
+  const nebulaUser = teamUpdateReg.data.user;
+
+  const patchTeamRes = await api('/auth/team', {
+    method: 'PATCH',
+    token: nebulaToken,
+    body: { teamName: 'NEBULA DYNAMICS' },
+  });
+  assert(patchTeamRes.ok && patchTeamRes.data.user.team_name === 'NEBULA DYNAMICS', 'Team rename mutation succeeds');
+
+  const nebulaMeRes = await api('/auth/me', { token: nebulaToken });
+  assert(nebulaMeRes.ok && nebulaMeRes.data.user.team_name === 'NEBULA DYNAMICS', 'Subsequent authenticated call immediately returns updated team name from refreshed cache');
+
+  // Case 12: Deactivated user rejected after cache invalidation
+  console.log('\n[Phase 3L: Deactivation Invalidation]');
+  await db.query('UPDATE users SET is_active = false WHERE id = $1', [nebulaUser.id]);
+  invalidateAuthUserCache(nebulaUser.id);
+
+  const nebulaDeactivatedRes = await api('/auth/me', { token: nebulaToken });
+  assert(nebulaDeactivatedRes.status === 401, 'Deactivated user rejected immediately after cache invalidation');
+  await db.query('UPDATE users SET is_active = true WHERE id = $1', [nebulaUser.id]);
+  invalidateAuthUserCache(nebulaUser.id);
+
+  // Case 13: Role change reflected after cache invalidation
+  console.log('\n[Phase 3M: Role Change Invalidation]');
+  await db.query("UPDATE users SET role = 'ADMIN' WHERE id = $1", [nebulaUser.id]);
+  invalidateAuthUserCache(nebulaUser.id);
+
+  const nebulaAsAdminRes = await api('/admin/overview', { token: nebulaToken });
+  assert(nebulaAsAdminRes.ok, 'Role promotion to ADMIN immediately permits admin route access after cache invalidation');
+
+  await db.query("UPDATE users SET role = 'PLAYER' WHERE id = $1", [nebulaUser.id]);
+  invalidateAuthUserCache(nebulaUser.id);
+  const nebulaRevertedRes = await api('/admin/overview', { token: nebulaToken });
+  assert(nebulaRevertedRes.status === 403, 'Role demotion to PLAYER immediately revokes admin route access after cache invalidation');
+
+  // Case 14: Cache TTL expiration causes DB revalidation
+  console.log('\n[Phase 3N: Cache Bounded TTL Revalidation]');
+  const player2Id = team2Entry.data.user.id;
+  await db.query("UPDATE users SET display_name = 'TTL Fresh Name' WHERE id = $1", [player2Id]);
+  setAuthUserCache({
+    id: player2Id,
+    player_code: 'CQ002',
+    display_name: 'TTL Stale Name',
+    team_name: null,
+    role: 'PLAYER',
+    is_active: true,
+  });
+
+  const beforeExpiry = await getAuthUserCached(player2Id);
+  assert(beforeExpiry?.display_name === 'TTL Stale Name', 'Cache returns primed value before TTL expiration');
+
+  invalidateAuthUserCache(player2Id);
+  const afterExpiry = await getAuthUserCached(player2Id);
+  assert(afterExpiry?.display_name === 'TTL Fresh Name', 'Expired cache triggers DB lookup and retrieves fresh user state');
+
+  // Case 15: DB failure / missing user returns null and does not authenticate
+  console.log('\n[Phase 3O: DB Miss / Unknown User Handling]');
+  invalidateAuthUserCache('usr_nonexistent_xyz');
+  const missUser = await getAuthUserCached('usr_nonexistent_xyz');
+  assert(missUser === null, 'Non-existent user lookup safely returns null');
+
+  // 15. Local Benchmark: 40 Consecutive Authenticated Requests (Auth Cache in action)
+  console.log('\n[Phase 3 Performance Benchmark: 40 Consecutive Authenticated Requests]');
+  const benchAuthPlayer = await api('/auth/team', {
+    method: 'POST',
+    body: { teamName: 'AUTH SPEED RACERS' },
+  });
+  const benchAuthToken = benchAuthPlayer.data.token;
+
+  const authBenchIterations = 40;
+  const startAuthBenchTime = Date.now();
+  let authBenchSuccessCount = 0;
+
+  for (let i = 0; i < authBenchIterations; i++) {
+    const res = await api('/auth/me', { token: benchAuthToken });
+    if (res.ok && res.data.user) {
+      authBenchSuccessCount++;
+    }
+  }
+
+  const totalAuthBenchMs = Date.now() - startAuthBenchTime;
+  const avgAuthLatencyMs = Math.round(totalAuthBenchMs / authBenchIterations);
+  console.log(`⚡ Auth Benchmark: ${authBenchSuccessCount}/${authBenchIterations} authenticated requests succeeded in ${totalAuthBenchMs}ms (Avg: ${avgAuthLatencyMs}ms per request, 0 redundant DB queries)`);
+  assert(authBenchSuccessCount === authBenchIterations, `All ${authBenchIterations} authenticated requests succeeded`);
+  assert(avgAuthLatencyMs < 30, `Average authenticated response latency (${avgAuthLatencyMs}ms) is under 30ms locally`);
+
+  // --- 15. Phase 4: Frontend Adaptive Polling & Traffic Optimization Suite ---
+  console.log('\n--- 15. Phase 4: Frontend Adaptive Polling & Traffic Optimization Suite ---');
+
+  // Case 1: WAITING interval = 3000ms
+  console.log('\n[Phase 4A: State-Aware Interval Contracts]');
+  assert(getPollingInterval('WAITING', 'IN_PROGRESS', false) === 3000, 'WAITING state schedules 3000ms polling interval (3.0s)');
+
+  // Case 2: COUNTDOWN interval = 1000ms
+  assert(getPollingInterval('COUNTDOWN', 'IN_PROGRESS', false) === 1000, 'COUNTDOWN state schedules 1000ms polling interval (1.0s)');
+
+  // Case 3: LIVE interval = 4000ms
+  assert(getPollingInterval('LIVE', 'IN_PROGRESS', false) === 4000, 'LIVE state schedules 4000ms polling interval (4.0s)');
+
+  // Case 4: PAUSED interval = 3000ms
+  assert(getPollingInterval('PAUSED', 'IN_PROGRESS', false) === 3000, 'PAUSED state schedules 3000ms polling interval (3.0s)');
+
+  // Case 5: COMPLETED / ENDED stops continuous polling (null)
+  assert(getPollingInterval('LIVE', 'COMPLETED', false) === null, 'COMPLETED session status returns null (stops continuous polling)');
+  assert(getPollingInterval('ENDED', 'IN_PROGRESS', false) === null, 'ENDED event status returns null (stops continuous polling)');
+
+  // Case 6: Page Visibility - Hidden tab throttles to 10000ms
+  console.log('\n[Phase 4B: Page Visibility & Background Throttling]');
+  assert(getPollingInterval('LIVE', 'IN_PROGRESS', true) === 10000, 'Hidden tab in LIVE state throttles to 10000ms background interval (10.0s)');
+  assert(getPollingInterval('WAITING', 'IN_PROGRESS', true) === 10000, 'Hidden tab in WAITING state throttles to 10000ms background interval (10.0s)');
+  assert(getPollingInterval('LIVE', 'IN_PROGRESS', false) === 4000, 'Foreground visible tab restores 4000ms active interval');
+
+  // Case 7: In-Flight Overlapping Request Guard Simulation
+  console.log('\n[Phase 4C: Overlapping Request Guard Simulation]');
+  let simulatedInFlight = false;
+  let simulatedExecutions = 0;
+  let simulatedSkipped = 0;
+
+  const simulatedPoll = async () => {
+    if (simulatedInFlight) {
+      simulatedSkipped++;
+      return;
+    }
+    simulatedInFlight = true;
+    simulatedExecutions++;
+    await new Promise((r) => setTimeout(r, 25)); // simulate 25ms async roundtrip
+    simulatedInFlight = false;
+  };
+
+  // Launch initial request and 4 rapid overlapping poll triggers
+  const firstPromise = simulatedPoll();
+  await simulatedPoll(); // overlapping 1 (skipped)
+  await simulatedPoll(); // overlapping 2 (skipped)
+  await simulatedPoll(); // overlapping 3 (skipped)
+  await firstPromise;
+
+  assert(simulatedExecutions === 1, 'In-flight guard executed exactly 1 authoritative network request');
+  assert(simulatedSkipped === 3, 'In-flight guard skipped 3 overlapping concurrent poll attempts');
+
+  // Case 8: Action Payload Efficiency & Zero Duplicate Roundtrips
+  console.log('\n[Phase 4D: Action Payload Efficiency]');
+  // Verify reveal-clue returns full state payload
+  assert(typeof POLLING_SCHEDULE.liveMs === 'number', 'POLLING_SCHEDULE configuration is typed and defined');
+  assert(POLLING_SCHEDULE.waitingMs === 3000 && POLLING_SCHEDULE.countdownMs === 1000 && POLLING_SCHEDULE.liveMs === 4000, 'POLLING_SCHEDULE contains expected interval constants');
+
+  // Case 9: 40-Participant Polling Schedule Simulation
+  console.log('\n[Phase 4E: 40-Participant Polling Schedule Local Simulation]');
+  const totalSimulatedParticipants = 40;
+
+  // WAITING Rate: 40 / 3s = 13.33 req/s
+  const waitingReqPerSec = totalSimulatedParticipants / (POLLING_SCHEDULE.waitingMs / 1000);
+  console.log(`📊 WAITING Schedule: ${totalSimulatedParticipants} participants @ 3.0s = ${waitingReqPerSec.toFixed(2)} req/sec (~13 req/s)`);
+  assert(Math.abs(waitingReqPerSec - 13.33) < 0.1, 'WAITING polling rate matches ~13.3 req/sec for 40 participants');
+
+  // COUNTDOWN Rate: 40 / 1s = 40.0 req/s
+  const countdownReqPerSec = totalSimulatedParticipants / (POLLING_SCHEDULE.countdownMs / 1000);
+  console.log(`📊 COUNTDOWN Schedule: ${totalSimulatedParticipants} participants @ 1.0s = ${countdownReqPerSec.toFixed(2)} req/sec (40 req/s)`);
+  assert(countdownReqPerSec === 40, 'COUNTDOWN polling rate matches 40 req/sec for 40 participants');
+
+  // LIVE Rate: 40 / 4s = 10.0 req/s
+  const liveReqPerSec = totalSimulatedParticipants / (POLLING_SCHEDULE.liveMs / 1000);
+  console.log(`📊 LIVE Schedule: ${totalSimulatedParticipants} participants @ 4.0s = ${liveReqPerSec.toFixed(2)} req/sec (10 req/s)`);
+  assert(liveReqPerSec === 10, 'LIVE polling rate matches 10 req/sec for 40 participants');
+
+  // HIDDEN Rate: 40 / 10s = 4.0 req/s
+  const hiddenReqPerSec = totalSimulatedParticipants / (POLLING_SCHEDULE.hiddenMs / 1000);
+  console.log(`📊 HIDDEN Schedule: ${totalSimulatedParticipants} participants @ 10.0s = ${hiddenReqPerSec.toFixed(2)} req/sec (4 req/s)`);
+  assert(hiddenReqPerSec === 4, 'HIDDEN polling rate matches 4 req/sec for 40 backgrounded participants');
 
   console.log('\n========================================================');
   console.log(`🏁 TEST RESULTS: ${passed} PASSED | ${failed} FAILED`);

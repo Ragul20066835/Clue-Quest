@@ -1,38 +1,21 @@
 import { Router, Request, Response } from 'express';
 import { db } from '../db/client.js';
 import { logEventAction } from '../services/auditService.js';
+import { getActiveEventCached, checkAndAdvanceCountdownCached } from '../services/cacheService.js';
 
 export const eventRouter = Router();
 
 export async function checkAndAdvanceCountdown(event: any) {
-  if (event.status === 'COUNTDOWN' && event.countdown_started_at) {
-    const elapsedMs = Date.now() - new Date(event.countdown_started_at).getTime();
-    const elapsedSeconds = elapsedMs / 1000;
-
-    if (elapsedSeconds >= 5) {
-      const now = new Date().toISOString();
-      await db.query(
-        "UPDATE events SET status = 'LIVE', started_at = $1 WHERE id = $2",
-        [now, event.id]
-      );
-      event.status = 'LIVE';
-      event.started_at = now;
-      await logEventAction('EVENT_TRANSITION_LIVE', null, event.id, { elapsed_seconds: elapsedSeconds });
-    }
-  }
-  return event;
+  return checkAndAdvanceCountdownCached(event);
 }
 
 eventRouter.get('/status', async (req: Request, res: Response): Promise<void> => {
   try {
-    const eventRes = await db.query('SELECT * FROM events ORDER BY created_at DESC LIMIT 1');
-    if (eventRes.rows.length === 0) {
+    let event = await getActiveEventCached();
+    if (!event) {
       res.status(404).json({ error: 'No event found' });
       return;
     }
-
-    let event = eventRes.rows[0];
-    event = await checkAndAdvanceCountdown(event);
 
     let countdownRemainingSeconds: number | null = null;
     if (event.status === 'COUNTDOWN' && event.countdown_started_at) {
@@ -89,13 +72,11 @@ eventRouter.get('/status', async (req: Request, res: Response): Promise<void> =>
 
 eventRouter.get('/leaderboard', async (req: Request, res: Response): Promise<void> => {
   try {
-    const eventRes = await db.query('SELECT * FROM events ORDER BY created_at DESC LIMIT 1');
-    if (eventRes.rows.length === 0) {
+    const event = await getActiveEventCached();
+    if (!event) {
       res.status(404).json({ error: 'No active event' });
       return;
     }
-
-    const event = eventRes.rows[0];
 
     const leaderboardRes = await db.query(`
       SELECT 

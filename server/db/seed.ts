@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import { db, initDb } from './client.js';
+import { invalidateAllCaches } from '../services/cacheService.js';
 
 export interface SeedQuestion {
   question_number: number;
@@ -365,6 +366,9 @@ export async function seedDatabase() {
     'SYSTEM_SEEDED',
     JSON.stringify({ total_users: 41, total_questions: 20, max_points: 2000 })
   ]);
+
+  // Invalidate in-memory caches to reflect newly seeded event and question bank
+  invalidateAllCaches();
 
   console.log('✨ CLUE QUEST seed complete! Ready for 40 participants.');
 }

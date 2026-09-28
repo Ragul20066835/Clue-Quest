@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import { authenticate, requirePlayer, AuthenticatedRequest } from '../middleware/auth.js';
 import { db } from '../db/client.js';
-import { checkAndAdvanceCountdown } from './eventRoutes.js';
+import { getActiveEventCached } from '../services/cacheService.js';
 import {
   getPlayerGameState,
   revealNextClue,
@@ -13,14 +13,12 @@ import {
 
 export const gameRouter = Router();
 
-// Helper to get active event ID with automatic countdown check
+// Helper to get active event from cache with automatic countdown check
 async function getActiveEvent() {
-  const res = await db.query('SELECT * FROM events ORDER BY created_at DESC LIMIT 1');
-  if (res.rows.length === 0) {
+  const event = await getActiveEventCached();
+  if (!event) {
     throw new Error('No active event found');
   }
-  let event = res.rows[0];
-  event = await checkAndAdvanceCountdown(event);
   return event;
 }
 

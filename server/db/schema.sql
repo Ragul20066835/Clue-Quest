@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_player_code ON users(player_code);
 CREATE INDEX IF NOT EXISTS idx_users_team_name ON users(team_name);
+CREATE INDEX IF NOT EXISTS idx_users_lower_team_name ON users(LOWER(team_name));
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
 -- Events Table
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
+CREATE INDEX IF NOT EXISTS idx_events_created_at_desc ON events(created_at DESC);
 
 -- Questions Table
 CREATE TABLE IF NOT EXISTS questions (
@@ -118,4 +120,5 @@ CREATE TABLE IF NOT EXISTS event_logs (
 CREATE INDEX IF NOT EXISTS idx_logs_event_id ON event_logs(event_id);
 CREATE INDEX IF NOT EXISTS idx_logs_user_id ON event_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_logs_action ON event_logs(action);
+CREATE INDEX IF NOT EXISTS idx_logs_event_action_user ON event_logs(event_id, action, user_id);
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON event_logs(created_at DESC);

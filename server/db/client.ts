@@ -38,6 +38,14 @@ export async function initDb() {
       pgPool = new Pool({
         connectionString: config.databaseUrl,
         ssl: { rejectUnauthorized: false },
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+      });
+
+      // Handle unexpected idle client errors to prevent uncaught exceptions
+      pgPool.on('error', (err) => {
+        console.error('⚠️ Unexpected error on idle PostgreSQL client pool:', err);
       });
 
       // Test connection
@@ -451,6 +459,32 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
           user.updated_at = new Date().toISOString();
         } else if (lower.includes('team_name =') || lower.includes('team_name=')) {
           user.team_name = params[0];
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes('is_active = false') || lower.includes('is_active=false')) {
+          user.is_active = false;
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes('is_active = true') || lower.includes('is_active=true')) {
+          user.is_active = true;
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes('is_active = $') || lower.includes('is_active=$')) {
+          user.is_active = Boolean(params[0]);
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes("role = 'admin'") || lower.includes("role='admin'")) {
+          user.role = 'ADMIN';
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes("role = 'player'") || lower.includes("role='player'")) {
+          user.role = 'PLAYER';
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes('role = $') || lower.includes('role=$')) {
+          user.role = params[0];
+          user.updated_at = new Date().toISOString();
+        } else if (lower.includes('display_name =') || lower.includes('display_name=')) {
+          const match = cleanSql.match(/display_name\s*=\s*'([^']+)'/i);
+          if (match) {
+            user.display_name = match[1];
+          } else {
+            user.display_name = params[0];
+          }
           user.updated_at = new Date().toISOString();
         }
         memoryStore.users.set(id, user);
