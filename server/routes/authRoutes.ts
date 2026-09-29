@@ -248,40 +248,64 @@ authRouter.post('/team', async (req: Request, res: Response): Promise<void> => {
         return;
       }
 
-      // Find an available player slot or assign new player slot
-      const availableUserRes = await db.query(
-        "SELECT id, player_code, display_name, team_name, role, is_active FROM users WHERE role = 'PLAYER' AND team_name IS NULL ORDER BY player_code ASC LIMIT 1"
-      );
-
-      if (availableUserRes.rows.length > 0) {
-        user = availableUserRes.rows[0];
-        await db.query(
-          'UPDATE users SET team_name = $1, display_name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-          [normTeam, user.id]
+      // Assign slot within a transaction to guarantee atomic session cleanup and assignment
+      user = await db.transaction(async (tx) => {
+        // Find an available player slot or assign new player slot
+        const availableUserRes = await tx.query(
+          "SELECT id, player_code, display_name, team_name, role, is_active FROM users WHERE role = 'PLAYER' AND team_name IS NULL ORDER BY player_code ASC LIMIT 1"
         );
-        user.team_name = normTeam;
-        user.display_name = normTeam;
-      } else {
-        // Fallback create user slot if needed
-        const newCode = `CQ${String(registeredCount + 1).padStart(3, '0')}`;
-        const newId = `usr_${newCode.toLowerCase()}`;
-        const dummyHash = await bcrypt.hash(`TEAM_${normTeam}_${Date.now()}`, 4);
 
-        const insertUserRes = await db.query(
-          'INSERT INTO users (id, player_code, display_name, team_name, password_hash, role, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-          [newId, newCode, normTeam, normTeam, dummyHash, 'PLAYER', true]
-        );
-        user = insertUserRes.rows[0] || {
-          id: newId,
-          player_code: newCode,
-          display_name: normTeam,
-          team_name: normTeam,
-          role: 'PLAYER',
-          is_active: true,
-        };
-      }
+        let assignedUser: any = null;
 
-      await logEventAction('TEAM_REGISTERED', user.id, null, {
+        if (availableUserRes.rows.length > 0) {
+          assignedUser = availableUserRes.rows[0];
+
+          // 1. Delete related question_attempts first for this user + active event
+          if (event?.id) {
+            await tx.query(
+              'DELETE FROM question_attempts WHERE session_id IN (SELECT id FROM game_sessions WHERE user_id = $1 AND event_id = $2)',
+              [assignedUser.id, event.id]
+            );
+            // 2. Delete related game_session second for this user + active event
+            await tx.query(
+              'DELETE FROM game_sessions WHERE user_id = $1 AND event_id = $2',
+              [assignedUser.id, event.id]
+            );
+          }
+
+          // 3. Assign the new team_name / display_name
+          await tx.query(
+            'UPDATE users SET team_name = $1, display_name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+            [normTeam, assignedUser.id]
+          );
+          assignedUser.team_name = normTeam;
+          assignedUser.display_name = normTeam;
+        } else {
+          // Fallback create user slot if needed
+          const newCode = `CQ${String(registeredCount + 1).padStart(3, '0')}`;
+          const newId = `usr_${newCode.toLowerCase()}`;
+          const dummyHash = await bcrypt.hash(`TEAM_${normTeam}_${Date.now()}`, 4);
+
+          const insertUserRes = await tx.query(
+            'INSERT INTO users (id, player_code, display_name, team_name, password_hash, role, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [newId, newCode, normTeam, normTeam, dummyHash, 'PLAYER', true]
+          );
+          assignedUser = insertUserRes.rows[0] || {
+            id: newId,
+            player_code: newCode,
+            display_name: normTeam,
+            team_name: normTeam,
+            role: 'PLAYER',
+            is_active: true,
+          };
+        }
+
+        return assignedUser;
+      });
+
+      invalidateAuthUserCache(user.id);
+
+      await logEventAction('TEAM_REGISTERED', user.id, event?.id || null, {
         player_code: user.player_code,
         team_name: normTeam,
       });

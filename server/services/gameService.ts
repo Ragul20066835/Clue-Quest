@@ -83,6 +83,13 @@ export async function getOrCreateGameSession(
     return existing.rows[0];
   }
 
+  // Prevent unregistered player from creating a session
+  const userRes = await db.query('SELECT id, team_name, role FROM users WHERE id = $1', [userId]);
+  const user = userRes.rows[0];
+  if (user && user.role === 'PLAYER' && !user.team_name) {
+    throw new Error('Team registration is required before a game session can be created.');
+  }
+
   const sessionId =
     `sess_${userId.replace('usr_', '')}_${Date.now()}`;
 

@@ -25,6 +25,12 @@ async function getActiveEvent() {
 gameRouter.get('/state', authenticate, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const user = req.user!;
+
+    if (user.role === 'PLAYER' && !user.team_name) {
+      res.status(403).json({ error: 'Team registration is required before accessing the game arena.' });
+      return;
+    }
+
     const event = await getActiveEvent();
 
     const gameState = await getPlayerGameState(user.id, event.id, event.status);

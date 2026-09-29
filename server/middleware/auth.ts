@@ -76,5 +76,9 @@ export function requirePlayer(req: AuthenticatedRequest, res: Response, next: Ne
     res.status(403).json({ error: 'Forbidden: Player privileges required' });
     return;
   }
+  if (!req.user.team_name) {
+    res.status(403).json({ error: 'Team registration is required before accessing the game arena.' });
+    return;
+  }
   next();
 }

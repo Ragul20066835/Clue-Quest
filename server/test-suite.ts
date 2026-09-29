@@ -11,6 +11,7 @@ import jwt from 'jsonwebtoken';
 import { config } from './config.js';
 import {
   getActiveEventCached,
+  setActiveEventCache,
   getQuestionBankCached,
   getQuestionByNumberCached,
   invalidateActiveEventCache,
@@ -1036,6 +1037,176 @@ async function runTests() {
   const hiddenReqPerSec = totalSimulatedParticipants / (POLLING_SCHEDULE.hiddenMs / 1000);
   console.log(`📊 HIDDEN Schedule: ${totalSimulatedParticipants} participants @ 10.0s = ${hiddenReqPerSec.toFixed(2)} req/sec (4 req/s)`);
   assert(hiddenReqPerSec === 4, 'HIDDEN polling rate matches 4 req/sec for 40 backgrounded participants');
+
+  // =========================================================================
+  // 12. Regression Suite: Fresh Team Registration & Stale Session Lifecycle
+  // =========================================================================
+  console.log('\n--- 12. Regression Suite: Fresh Team Registration & Stale Session Lifecycle ---');
+
+  // Ensure active event is LIVE for gameplay lifecycle testing
+  const activeEvt = await getActiveEventCached();
+  const activeEventId = activeEvt?.id || 'evt_cluequest_2026_main';
+  await db.query("UPDATE events SET status = 'LIVE', started_at = CURRENT_TIMESTAMP WHERE id = $1", [activeEventId]);
+  const liveEvtRes = await db.query("SELECT * FROM events WHERE id = $1", [activeEventId]);
+  setActiveEventCache(liveEvtRes.rows[0]);
+
+  // -------------------------------------------------------------------------
+  // TEST B: Unregistered player attempts GET /game/state
+  // Expected: 403 Forbidden, no game_session created, no timer started
+  // -------------------------------------------------------------------------
+  console.log('\n[Regression Test B: Unregistered Player Cannot Create Session]');
+  // CQ039 is an unassigned slot (team_name is NULL)
+  const unregLogin = await api('/auth/login', {
+    method: 'POST',
+    body: { player_code: 'CQ039', password: 'VSBece2026!' },
+  });
+  assert(unregLogin.ok, 'Unregistered CQ039 logs in with default credentials');
+  const unregToken = unregLogin.data.token;
+  assert(unregLogin.data.user.team_name === null, 'CQ039 has team_name === NULL');
+
+  const unregGameState = await api('/game/state', { token: unregToken });
+  assert(unregGameState.status === 403, 'Unregistered player receives 403 when requesting /game/state');
+  assert(unregGameState.data.error.includes('Team registration is required'), 'Error message states team registration required');
+
+  const unregSessionsInDb = await db.query(
+    'SELECT * FROM game_sessions WHERE user_id = $1 AND event_id = $2',
+    [unregLogin.data.user.id, activeEventId]
+  );
+  assert(unregSessionsInDb.rows.length === 0, 'No game_session record created for unregistered player');
+
+  // -------------------------------------------------------------------------
+  // TEST A: Unassigned slot with stale game_session -> Register new team "phoenix"
+  // Expected:
+  // - Registration succeeds
+  // - Stale attempts and session removed
+  // - User team_name set to "phoenix"
+  // - Next GET /game/state creates fresh session (IN_PROGRESS, Q01, C1, 100 PTS)
+  // -------------------------------------------------------------------------
+  console.log('\n[Regression Test A: Stale Session Cleanup on Fresh Team Registration]');
+  // Pick next available player slot
+  const nextAvailableRes = await db.query("SELECT id, player_code FROM users WHERE role = 'PLAYER' AND team_name IS NULL ORDER BY player_code ASC LIMIT 1");
+  const targetUser = nextAvailableRes.rows[0];
+  const targetSlotCode = targetUser.player_code;
+
+  // Manually simulate a stale expired session for targetUser in the active event
+  const staleSessionId = `sess_stale_${targetSlotCode}_${Date.now()}`;
+  const staleStartedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 mins ago
+  await db.query(`
+    INSERT INTO game_sessions (id, event_id, user_id, status, current_question, current_clue_level, current_question_value, total_score, started_at, completed_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+  `, [staleSessionId, activeEventId, targetUser.id, 'COMPLETED', 1, 1, 100, 0, staleStartedAt, new Date(Date.now() - 10 * 60 * 1000).toISOString()]);
+
+  // Insert a stale attempt for that session
+  await db.query(`
+    INSERT INTO question_attempts (id, session_id, question_id, highest_clue_level, final_question_value, user_answer, correct_answer, is_correct, earned_points)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+  `, [`att_stale_${Date.now()}`, staleSessionId, 'q_01', 1, 100, 'WRONG', 'RESISTOR', false, 0]);
+
+  // Verify stale session exists before registration
+  const preCheckSessions = await db.query('SELECT * FROM game_sessions WHERE user_id = $1 AND event_id = $2', [targetUser.id, activeEventId]);
+  assert(preCheckSessions.rows.length === 1 && preCheckSessions.rows[0].status === 'COMPLETED', `Stale COMPLETED session verified for ${targetSlotCode} before registration`);
+
+  // Register new team "phoenix"
+  const phoenixReg = await api('/auth/team', {
+    method: 'POST',
+    body: { teamName: 'phoenix' },
+  });
+  assert(phoenixReg.ok, 'Team "phoenix" registered successfully');
+  assert(phoenixReg.data.user.player_code === targetSlotCode, `Assigned to available slot ${targetSlotCode}`);
+  assert(phoenixReg.data.user.team_name === 'phoenix', 'Team name assigned as "phoenix"');
+  const phoenixToken = phoenixReg.data.token;
+
+  // Verify stale session and attempts were deleted by the registration transaction
+  const postRegSessions = await db.query('SELECT * FROM game_sessions WHERE user_id = $1 AND event_id = $2', [targetUser.id, activeEventId]);
+  assert(postRegSessions.rows.length === 0, 'Stale game_session deleted during team registration');
+
+  const postRegAttempts = await db.query('SELECT * FROM question_attempts WHERE session_id = $1', [staleSessionId]);
+  assert(postRegAttempts.rows.length === 0, 'Stale question_attempts deleted during team registration');
+
+  // Request game state as "phoenix"
+  const phoenixGameState = await api('/game/state', { token: phoenixToken });
+  assert(phoenixGameState.ok, 'GET /game/state succeeds for fresh team "phoenix"');
+  assert(phoenixGameState.data.session.status === 'IN_PROGRESS', 'Fresh session is IN_PROGRESS (NOT COMPLETED)');
+  assert(phoenixGameState.data.session.current_question === 1, 'Current question is Q01');
+  assert(phoenixGameState.data.session.current_clue_level === 1, 'Current clue is C1');
+  assert(phoenixGameState.data.session.current_question_value === 100, 'Current question value is 100 PTS');
+  assert(phoenixGameState.data.session.total_score === 0, 'Total score starts at 0');
+  assert(phoenixGameState.data.question !== null, 'Question content is returned for active gameplay');
+  assert(phoenixGameState.data.is_expired === false, 'Fresh session is NOT expired');
+
+  // -------------------------------------------------------------------------
+  // TEST C: Registered player with existing IN_PROGRESS session
+  // Expected: Same session reused, timer not reset, question state preserved
+  // -------------------------------------------------------------------------
+  console.log('\n[Regression Test C: Active Session Preservation for Registered Team]');
+  const existingSessionId = phoenixGameState.data.session.id;
+
+  // Reveal Clue 2 for phoenix
+  const revealRes = await api('/game/reveal-clue', {
+    method: 'POST',
+    token: phoenixToken,
+    body: { requested_level: 2 },
+  });
+  assert(revealRes.ok && revealRes.data.session.current_clue_level === 2, 'Phoenix reveals Clue 2 (75 PTS)');
+
+  // Re-fetch game state
+  const stateRefetch = await api('/game/state', { token: phoenixToken });
+  assert(stateRefetch.data.session.id === existingSessionId, 'Same session ID reused on subsequent fetches');
+  assert(stateRefetch.data.session.current_clue_level === 2, 'Clue level 2 preserved');
+  assert(stateRefetch.data.session.current_question_value === 75, 'Question value 75 PTS preserved');
+
+  // -------------------------------------------------------------------------
+  // TEST D: Registered player with COMPLETED session remains completed
+  // -------------------------------------------------------------------------
+  console.log('\n[Regression Test D: Completed Session Remains Final]');
+  // Mark phoenix session completed
+  await db.query("UPDATE game_sessions SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE id = $1", [existingSessionId]);
+
+  const completedState = await api('/game/state', { token: phoenixToken });
+  assert(completedState.ok && completedState.data.session.status === 'COMPLETED', 'Session status remains COMPLETED');
+  assert(completedState.data.question === null, 'Question content is null for completed session');
+
+  const revealOnCompleted = await api('/game/reveal-clue', {
+    method: 'POST',
+    token: phoenixToken,
+    body: { requested_level: 3 },
+  });
+  assert(revealOnCompleted.status === 400, 'Cannot reveal clues on a completed session');
+
+  // -------------------------------------------------------------------------
+  // TEST E: Cleanup isolation between different player slots
+  // -------------------------------------------------------------------------
+  console.log('\n[Regression Test E: Cleanup Isolation Between Slots]');
+  // Find two unassigned slots
+  const unassignedSlots = await db.query("SELECT id, player_code FROM users WHERE role = 'PLAYER' AND team_name IS NULL ORDER BY player_code ASC LIMIT 2");
+  const userX = unassignedSlots.rows[0];
+  const userY = unassignedSlots.rows[1];
+
+  const sessionXId = `sess_x_${Date.now()}`;
+  const sessionYId = `sess_y_${Date.now()}`;
+
+  await db.query(`
+    INSERT INTO game_sessions (id, event_id, user_id, status, current_question, current_clue_level, current_question_value, total_score)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+  `, [sessionXId, activeEventId, userX.id, 'IN_PROGRESS', 5, 2, 75, 250]);
+
+  await db.query(`
+    INSERT INTO game_sessions (id, event_id, user_id, status, current_question, current_clue_level, current_question_value, total_score)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+  `, [sessionYId, activeEventId, userY.id, 'IN_PROGRESS', 8, 3, 50, 450]);
+
+  // Register team for User X slot
+  const regX = await api('/auth/team', {
+    method: 'POST',
+    body: { teamName: 'ISOLATION_TEAM_X' },
+  });
+  assert(regX.ok && regX.data.user.player_code === userX.player_code, `Team X assigned to slot ${userX.player_code}`);
+
+  // Verify User X's stale session was deleted, but User Y's session was NOT deleted
+  const sessXCheck = await db.query('SELECT * FROM game_sessions WHERE id = $1', [sessionXId]);
+  const sessYCheck = await db.query('SELECT * FROM game_sessions WHERE id = $1', [sessionYId]);
+  assert(sessXCheck.rows.length === 0, `Slot ${userX.player_code} session deleted upon registration`);
+  assert(sessYCheck.rows.length === 1 && sessYCheck.rows[0].total_score === 450, `Slot ${userY.player_code} session remains untouched with original score (450 PTS)`);
 
   console.log('\n========================================================');
   console.log(`🏁 TEST RESULTS: ${passed} PASSED | ${failed} FAILED`);

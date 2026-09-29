@@ -143,22 +143,27 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
   if (lower.startsWith('select') && lower.includes('from users')) {
     let rows = Array.from(memoryStore.users.values());
     if (lower.includes('where lower(player_code) =') || lower.includes('where lower(player_code)=')) {
-      const code = String(params[0]).toLowerCase();
+      const match = cleanSql.match(/where\s+lower\(player_code\)\s*=\s*'([^']+)'/i);
+      const code = (params[0] !== undefined ? String(params[0]) : (match ? match[1] : '')).toLowerCase();
       rows = rows.filter(u => u.player_code.toLowerCase() === code);
       if (lower.includes("and role = 'admin'")) {
         rows = rows.filter(u => u.role === 'ADMIN');
       }
     } else if (lower.includes('where player_code =') || lower.includes('where player_code=')) {
-      const code = String(params[0]).toLowerCase();
+      const match = cleanSql.match(/where\s+player_code\s*=\s*'([^']+)'/i);
+      const code = (params[0] !== undefined ? String(params[0]) : (match ? match[1] : '')).toLowerCase();
       rows = rows.filter(u => u.player_code.toLowerCase() === code);
     } else if (lower.includes('where id =') && lower.includes("and role = 'player'")) {
-      const id = params[0];
+      const match = cleanSql.match(/where\s+id\s*=\s*'([^']+)'/i);
+      const id = params[0] !== undefined ? params[0] : (match ? match[1] : '');
       rows = rows.filter(u => u.id === id && u.role === 'PLAYER');
     } else if (lower.includes('where id =') || lower.includes('where id=')) {
-      const id = params[0];
+      const match = cleanSql.match(/where\s+id\s*=\s*'([^']+)'/i);
+      const id = params[0] !== undefined ? params[0] : (match ? match[1] : '');
       rows = rows.filter(u => u.id === id);
     } else if (lower.includes('where lower(team_name) =') || lower.includes('where team_name =')) {
-      const tName = String(params[0]).toLowerCase();
+      const match = cleanSql.match(/where\s+(?:lower\(team_name\)|team_name)\s*=\s*'([^']+)'/i);
+      const tName = (params[0] !== undefined ? String(params[0]) : (match ? match[1] : '')).toLowerCase();
       const excludeId = params[1] || null;
       rows = rows.filter(u => u.team_name && u.team_name.toLowerCase() === tName && (excludeId ? u.id !== excludeId : true));
     } else if (lower.includes("team_name is not null")) {
@@ -557,7 +562,11 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
         sess.current_clue_level = 1;
         sess.current_question_value = 100;
         sess.updated_at = new Date().toISOString();
-      } else if (lower.includes("status = 'completed'") || lower.includes('status = $1')) {
+      } else if (lower.includes("status = 'completed'")) {
+        sess.status = 'COMPLETED';
+        sess.completed_at = new Date().toISOString();
+        sess.updated_at = new Date().toISOString();
+      } else if (lower.includes('status = $')) {
         sess.status = params[0] || 'COMPLETED';
         sess.completed_at = new Date().toISOString();
         sess.updated_at = new Date().toISOString();
@@ -600,6 +609,80 @@ function executeMemoryQuery<T>(sql: string, params: any[]): { rows: T[]; rowCoun
 
   if (lower.startsWith('delete from clues')) {
     memoryStore.clues.clear();
+    return { rows: [], rowCount: 0 };
+  }
+
+  if (lower.startsWith('delete from question_attempts')) {
+    if (params.length === 0) {
+      const count = memoryStore.question_attempts.size;
+      memoryStore.question_attempts.clear();
+      return { rows: [], rowCount: count };
+    }
+    if (lower.includes('where session_id in (select id from game_sessions where user_id =') || (lower.includes('user_id = $1') && lower.includes('event_id = $2'))) {
+      const uId = params[0];
+      const eId = params[1];
+      const targetSessionIds = new Set(
+        Array.from(memoryStore.game_sessions.values())
+          .filter(s => s.user_id === uId && s.event_id === eId)
+          .map(s => s.id)
+      );
+      let count = 0;
+      for (const [id, att] of Array.from(memoryStore.question_attempts.entries())) {
+        if (targetSessionIds.has(att.session_id)) {
+          memoryStore.question_attempts.delete(id);
+          count++;
+        }
+      }
+      return { rows: [], rowCount: count };
+    }
+    if (lower.includes('where session_id =') || lower.includes('where session_id=')) {
+      const sId = params[0];
+      let count = 0;
+      for (const [id, att] of Array.from(memoryStore.question_attempts.entries())) {
+        if (att.session_id === sId) {
+          memoryStore.question_attempts.delete(id);
+          count++;
+        }
+      }
+      return { rows: [], rowCount: count };
+    }
+    return { rows: [], rowCount: 0 };
+  }
+
+  if (lower.startsWith('delete from game_sessions')) {
+    if (params.length === 0) {
+      const count = memoryStore.game_sessions.size;
+      memoryStore.game_sessions.clear();
+      return { rows: [], rowCount: count };
+    }
+    if (lower.includes('where user_id =') && lower.includes('and event_id =')) {
+      const uId = params[0];
+      const eId = params[1];
+      let count = 0;
+      for (const [id, sess] of Array.from(memoryStore.game_sessions.entries())) {
+        if (sess.user_id === uId && sess.event_id === eId) {
+          memoryStore.game_sessions.delete(id);
+          count++;
+        }
+      }
+      return { rows: [], rowCount: count };
+    }
+    if (lower.includes('where event_id =') || lower.includes('where event_id=')) {
+      const eId = params[0];
+      let count = 0;
+      for (const [id, sess] of Array.from(memoryStore.game_sessions.entries())) {
+        if (sess.event_id === eId) {
+          memoryStore.game_sessions.delete(id);
+          count++;
+        }
+      }
+      return { rows: [], rowCount: count };
+    }
+    if (lower.includes('where id =') || lower.includes('where id=')) {
+      const id = params[0];
+      const exists = memoryStore.game_sessions.delete(id);
+      return { rows: [], rowCount: exists ? 1 : 0 };
+    }
     return { rows: [], rowCount: 0 };
   }
 
